@@ -126,6 +126,8 @@ struct Rpc {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -139,6 +141,54 @@ fn notify(method: &str, params: serde_json::Value) -> Message {
     Message::Text(
         serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string().into(),
     )
+}
+
+/// 生成与请求 ID 对应的 JSON-RPC 成功响应。
+fn command_result(id: &str, result: serde_json::Value) -> Message {
+    Message::Text(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string().into())
+}
+
+/// 生成与请求 ID 对应的 JSON-RPC 错误响应。
+fn command_error(id: &str, code: i64, message: &str) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message}
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+/// 处理已注册的内置命令；命令参数不接受隐式或多余字段。
+fn command_response(
+    id: &str,
+    method: &str,
+    params: &serde_json::Value,
+    collector: &Collector,
+    interval: u64,
+    process_started: Instant,
+) -> Message {
+    match method {
+        "agent.status" if params.as_object().is_some_and(|values| values.is_empty()) => command_result(
+            id,
+            serde_json::json!({
+                "agent_version": env!("CARGO_PKG_VERSION"),
+                "process_uptime_secs": process_started.elapsed().as_secs(),
+                "report_interval_secs": interval,
+                "counted_ifaces": collector.counted_ifaces(),
+            }),
+        ),
+        "agent.status" => command_error(id, -32602, "agent.status 不接收参数"),
+        _ => command_error(id, -32601, "不支持的命令方法"),
+    }
+}
+
+/// 在保留 Facts 字段的同时声明本 agent 可执行的内置命令。
+fn hello_params(mut facts: serde_json::Value) -> serde_json::Value {
+    facts["capabilities"] = serde_json::json!(["agent.status"]);
+    facts
 }
 
 /// Writes under a deadline drawn from the remaining silence budget.
@@ -177,6 +227,7 @@ fn remaining(last_frame: Instant) -> Duration {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = parse_args()?;
+    let process_started = Instant::now();
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
     // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
@@ -202,7 +253,9 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) =
+            session(&url, &args.token, &mut collector, args.interval, process_started, &mut connected).await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -273,6 +326,7 @@ async fn session(
     token: &str,
     collector: &mut Collector,
     interval: u64,
+    process_started: Instant,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
@@ -311,7 +365,7 @@ async fn session(
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    send(&mut ws, notify("hello", hello_params(serde_json::to_value(facts)?)), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -340,7 +394,19 @@ async fn session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
-                            if rpc.method == "ping.tasks" {
+                            if let Some(id) = rpc.id.as_deref() {
+                                let reply = command_response(
+                                    id,
+                                    &rpc.method,
+                                    &rpc.params,
+                                    collector,
+                                    interval,
+                                    process_started,
+                                );
+                                if result_tx.send(reply).await.is_err() {
+                                    break Err(anyhow!("command response queue closed"));
+                                }
+                            } else if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
@@ -805,5 +871,44 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+
+    #[test]
+    fn hello_advertises_supported_commands_without_changing_facts() {
+        let hello = hello_params(serde_json::json!({"hostname": "node-a"}));
+        assert_eq!(hello["hostname"], "node-a");
+        assert_eq!(hello["capabilities"], serde_json::json!(["agent.status"]));
+    }
+
+    #[test]
+    fn agent_status_returns_process_and_collection_details() {
+        let collector = Collector::default();
+        let started = Instant::now() - Duration::from_secs(4);
+        let reply =
+            command_response("request-1", "agent.status", &serde_json::json!({}), &collector, 15, started);
+        let Message::Text(text) = reply else { panic!("command reply must be text") };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], "request-1");
+        assert_eq!(value["result"]["agent_version"], env!("CARGO_PKG_VERSION"));
+        assert!(value["result"]["process_uptime_secs"].as_u64().unwrap() >= 4);
+        assert_eq!(value["result"]["report_interval_secs"], 15);
+        assert!(value["result"]["counted_ifaces"].is_array());
+    }
+
+    #[test]
+    fn unsupported_command_and_invalid_status_params_return_json_rpc_errors() {
+        let collector = Collector::default();
+        let started = Instant::now();
+        for (method, params, code) in [
+            ("not.registered", serde_json::json!({}), -32601),
+            ("agent.status", serde_json::json!({"extra": true}), -32602),
+        ] {
+            let reply = command_response("request-2", method, &params, &collector, 1, started);
+            let Message::Text(text) = reply else { panic!("command error must be text") };
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["id"], "request-2");
+            assert_eq!(value["error"]["code"], code);
+        }
     }
 }

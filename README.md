@@ -22,6 +22,7 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 
 安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
 `/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
+安装命令需要以 root 执行，安装后的 systemd / OpenRC 服务也以 root 运行。
 
 ## 运行
 

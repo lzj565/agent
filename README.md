@@ -8,9 +8,10 @@
 
 - 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo
 - 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
-- 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
+- 监控采集不缓存状态，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
+- 通过 Monitor 白名单命令校验和应用 sing-box 配置；应用前先校验，原子替换后重启并检查服务，失败时恢复备份
 
 ## 安装
 
@@ -27,6 +28,7 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 `/opt/monitor/sing-box` 和 `/opt/monitor/libcronet.so`。首次安装会在 `/etc/sing-box/config.json`
 写入最小配置（已有配置保留并校验），使用独立的 `sing-box` 系统账户创建服务、启用开机启动并运行。
 卸载会移除安装器创建的服务和二进制，但保留配置。初始配置没有 inbound，因此服务运行后不会监听代理端口。
+配置应用时会在 `/etc/sing-box` 短暂创建校验文件和 `0600` 事务备份；成功或成功回滚后清理，回滚状态无法确认时保留备份供排查。
 
 ## 运行
 

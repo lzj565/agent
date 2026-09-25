@@ -5,13 +5,15 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::collect::Collector;
-use crate::singbox::{ControlAction, ControlError};
+use crate::singbox::{ConfigAction, ControlAction, ControlError};
 
 /// Agent 在 hello 中声明的内置命令白名单。
 pub const CAPABILITIES: &[&str] = &[
     "agent.status",
     "singbox.status",
     "singbox.config.get",
+    "singbox.config.check",
+    "singbox.config.apply",
     "singbox.start",
     "singbox.stop",
     "singbox.restart",
@@ -50,7 +52,47 @@ pub fn control_request(id: &str, method: &str, params: &Value) -> Option<Result<
 }
 
 pub fn busy_response(id: &str) -> Message {
-    command_error(id, CONTROL_BUSY_CODE, "sing-box 服务操作正在进行")
+    command_error(id, CONTROL_BUSY_CODE, "sing-box 操作正在进行")
+}
+
+pub struct ConfigRequest {
+    pub action: ConfigAction,
+    pub content: String,
+}
+
+/// 配置命令只接受一份受限大小的 UTF-8 JSON 文本。
+pub fn config_request(id: &str, method: &str, params: &Value) -> Option<Result<ConfigRequest, Message>> {
+    let action = ConfigAction::from_method(method)?;
+    Some((|| {
+        let Some(values) = params.as_object() else {
+            return Err(command_error(id, -32602, "配置命令参数必须是对象"));
+        };
+        if values.len() != 1 {
+            return Err(command_error(id, -32602, "配置命令只接受 content 参数"));
+        }
+        let Some(content) = values.get("content").and_then(Value::as_str) else {
+            return Err(command_error(id, -32602, "配置命令 content 必须是字符串"));
+        };
+        if content.len() > 32 * 1024 {
+            return Err(command_error(id, -32602, "sing-box 配置超过 32 KiB 限制"));
+        }
+        Ok(ConfigRequest { action, content: content.to_owned() })
+    })())
+}
+
+pub async fn config_response(id: &str, request: ConfigRequest) -> Message {
+    let started = Instant::now();
+    let result = match request.action {
+        ConfigAction::Check => crate::singbox::config_check(request.content).await,
+        ConfigAction::Apply => crate::singbox::config_apply(request.content).await,
+    };
+    eprintln!(
+        "command id={id} method={} success={} elapsed_ms={}",
+        request.action.method(),
+        result.is_ok(),
+        started.elapsed().as_millis()
+    );
+    control_result(id, result)
 }
 
 pub async fn control_response(id: &str, action: ControlAction) -> Message {
@@ -135,6 +177,35 @@ mod tests {
             assert_eq!(value["error"]["code"], -32602);
         }
         assert!(control_request("control-1", "shell.exec", &json!({})).is_none());
+    }
+
+    #[test]
+    fn config_requests_require_one_bounded_content_string() {
+        let request =
+            config_request("config-1", "singbox.config.check", &json!({"content": "{}"})).unwrap().unwrap();
+        assert_eq!(request.action, ConfigAction::Check);
+        assert_eq!(request.content, "{}");
+        let error =
+            match config_request("config-2", "singbox.config.apply", &json!({"content": "{}", "extra": 1})) {
+                Some(Err(error)) => error,
+                _ => panic!("多余参数必须被拒绝"),
+            };
+        let Message::Text(text) = error else { panic!("命令错误必须是文本帧") };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["error"]["message"], "配置命令只接受 content 参数");
+
+        let error = match config_request(
+            "config-3",
+            "singbox.config.check",
+            &json!({"content": "x".repeat(32 * 1024 + 1)}),
+        ) {
+            Some(Err(error)) => error,
+            _ => panic!("超限配置必须被拒绝"),
+        };
+        let Message::Text(text) = error else { panic!("命令错误必须是文本帧") };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["error"]["message"], "sing-box 配置超过 32 KiB 限制");
+        assert!(config_request("config-4", "shell.exec", &json!({})).is_none());
     }
 
     #[test]

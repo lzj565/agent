@@ -367,6 +367,7 @@ async fn session(
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if let Some(id) = rpc.id.as_deref() {
+                                let config_request = command::config_request(id, &rpc.method, &rpc.params);
                                 let reply = match command::control_request(id, &rpc.method, &rpc.params) {
                                     Some(Ok(action)) => match control_gate.clone().try_acquire_owned() {
                                         Ok(permit) => {
@@ -382,6 +383,25 @@ async fn session(
                                         Err(_) => Some(command::busy_response(id)),
                                     },
                                     Some(Err(error)) => Some(error),
+                                    None if config_request.is_some() => match config_request {
+                                        Some(Ok(request)) => match control_gate.clone().try_acquire_owned() {
+                                            Ok(permit) => {
+                                                let request_id = id.to_owned();
+                                                let reply_tx = result_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let reply = command::config_response(&request_id, request).await;
+                                                    drop(permit);
+                                                    if reply_tx.send(reply).await.is_err() {
+                                                        eprintln!("command id={request_id} configuration response queue closed");
+                                                    }
+                                                });
+                                                None
+                                            }
+                                            Err(_) => Some(command::busy_response(id)),
+                                        },
+                                        Some(Err(error)) => Some(error),
+                                        None => None,
+                                    },
                                     None if rpc.method == "singbox.config.get" && rpc.params.as_object().is_some_and(|values| values.is_empty()) => {
                                         let request_id = id.to_owned();
                                         let reply_tx = result_tx.clone();
@@ -884,6 +904,8 @@ mod tests {
                 "agent.status",
                 "singbox.status",
                 "singbox.config.get",
+                "singbox.config.check",
+                "singbox.config.apply",
                 "singbox.start",
                 "singbox.stop",
                 "singbox.restart",

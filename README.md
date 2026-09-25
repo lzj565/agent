@@ -23,6 +23,8 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
 `/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
 安装命令需要以 root 执行，安装后的 systemd / OpenRC 服务也以 root 运行。
+安装脚本也会把 sing-box 二进制和 `libcronet.so` 运行库安装到 `/opt/monitor`，路径分别是
+`/opt/monitor/sing-box` 和 `/opt/monitor/libcronet.so`。升级时更新，卸载时删除；不会自动配置或运行 sing-box。
 
 ## 运行
 

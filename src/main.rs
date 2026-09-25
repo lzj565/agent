@@ -3,6 +3,7 @@
 mod collect;
 
 use std::time::Duration;
+use std::{os::unix::fs::PermissionsExt, path::Path, process::Stdio};
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
 // arithmetic cannot drift from the timers enforcing it, and tests can advance
@@ -13,6 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -137,6 +139,12 @@ struct PingTask {
     interval: u64,
 }
 
+const SING_BOX_PATH: &str = "/opt/monitor/sing-box";
+const SING_BOX_LIB_DIR: &str = "/opt/monitor";
+const SING_BOX_CONFIG_PATH: &str = "/etc/sing-box/config.json";
+const SING_BOX_SERVICE: &str = "sing-box.service";
+const STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn notify(method: &str, params: serde_json::Value) -> Message {
     Message::Text(
         serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string().into(),
@@ -162,7 +170,7 @@ fn command_error(id: &str, code: i64, message: &str) -> Message {
 }
 
 /// 处理已注册的内置命令；命令参数不接受隐式或多余字段。
-fn command_response(
+async fn command_response(
     id: &str,
     method: &str,
     params: &serde_json::Value,
@@ -181,13 +189,99 @@ fn command_response(
             }),
         ),
         "agent.status" => command_error(id, -32602, "agent.status 不接收参数"),
+        "singbox.status" if params.as_object().is_some_and(|values| values.is_empty()) => {
+            command_result(id, singbox_status().await)
+        }
+        "singbox.status" => command_error(id, -32602, "singbox.status 不接收参数"),
         _ => command_error(id, -32601, "不支持的命令方法"),
     }
 }
 
+/// 查询本机 sing-box 安装、systemd 服务和配置文件状态。
+async fn singbox_status() -> serde_json::Value {
+    let installed = Path::new(SING_BOX_PATH)
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    let version = if installed { sing_box_version().await } else { None };
+    let (service_exists, running) = systemd_service_status().await;
+    serde_json::json!({
+        "installed": installed,
+        "version": version,
+        "service_exists": service_exists,
+        "running": running,
+        "config_exists": Path::new(SING_BOX_CONFIG_PATH).is_file(),
+        "config_path": SING_BOX_CONFIG_PATH,
+    })
+}
+
+async fn sing_box_version() -> Option<String> {
+    let output =
+        bounded_command(SING_BOX_PATH, &["version"], Some(("LD_LIBRARY_PATH", SING_BOX_LIB_DIR))).await?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sing_box_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+async fn systemd_service_status() -> (bool, bool) {
+    let Some(output) = bounded_command(
+        "systemctl",
+        &["show", "--property=LoadState", "--property=ActiveState", SING_BOX_SERVICE],
+        None,
+    )
+    .await
+    else {
+        return (false, false);
+    };
+    if !output.status.success() {
+        return (false, false);
+    }
+    parse_systemd_service_status(&String::from_utf8_lossy(&output.stdout))
+}
+
+async fn bounded_command(
+    program: &str,
+    args: &[&str],
+    environment: Option<(&str, &str)>,
+) -> Option<std::process::Output> {
+    let mut command = TokioCommand::new(program);
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    if let Some((key, value)) = environment {
+        command.env(key, value);
+    }
+    let child = command.spawn().ok()?;
+    tokio::time::timeout(STATUS_COMMAND_TIMEOUT, child.wait_with_output()).await.ok()?.ok()
+}
+
+fn parse_sing_box_version(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("sing-box version ")
+            .and_then(|version| version.split_whitespace().next())
+            .filter(|version| !version.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn parse_systemd_service_status(output: &str) -> (bool, bool) {
+    let mut load_state = None;
+    let mut active_state = None;
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "LoadState" => load_state = Some(value.trim()),
+            "ActiveState" => active_state = Some(value.trim()),
+            _ => {}
+        }
+    }
+    let service_exists = load_state.is_some_and(|state| !state.is_empty() && state != "not-found");
+    let running = service_exists && active_state == Some("active");
+    (service_exists, running)
+}
+
 /// 在保留 Facts 字段的同时声明本 agent 可执行的内置命令。
 fn hello_params(mut facts: serde_json::Value) -> serde_json::Value {
-    facts["capabilities"] = serde_json::json!(["agent.status"]);
+    facts["capabilities"] = serde_json::json!(["agent.status", "singbox.status"]);
     facts
 }
 
@@ -402,7 +496,8 @@ async fn session(
                                     collector,
                                     interval,
                                     process_started,
-                                );
+                                )
+                                .await;
                                 if result_tx.send(reply).await.is_err() {
                                     break Err(anyhow!("command response queue closed"));
                                 }
@@ -877,15 +972,16 @@ mod tests {
     fn hello_advertises_supported_commands_without_changing_facts() {
         let hello = hello_params(serde_json::json!({"hostname": "node-a"}));
         assert_eq!(hello["hostname"], "node-a");
-        assert_eq!(hello["capabilities"], serde_json::json!(["agent.status"]));
+        assert_eq!(hello["capabilities"], serde_json::json!(["agent.status", "singbox.status"]));
     }
 
-    #[test]
-    fn agent_status_returns_process_and_collection_details() {
+    #[tokio::test]
+    async fn agent_status_returns_process_and_collection_details() {
         let collector = Collector::default();
         let started = Instant::now() - Duration::from_secs(4);
         let reply =
-            command_response("request-1", "agent.status", &serde_json::json!({}), &collector, 15, started);
+            command_response("request-1", "agent.status", &serde_json::json!({}), &collector, 15, started)
+                .await;
         let Message::Text(text) = reply else { panic!("command reply must be text") };
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["jsonrpc"], "2.0");
@@ -896,15 +992,54 @@ mod tests {
         assert!(value["result"]["counted_ifaces"].is_array());
     }
 
+    #[tokio::test]
+    async fn singbox_status_returns_the_expected_state_fields() {
+        let reply = command_response(
+            "request-3",
+            "singbox.status",
+            &serde_json::json!({}),
+            &Collector::default(),
+            1,
+            Instant::now(),
+        )
+        .await;
+        let Message::Text(text) = reply else { panic!("command reply must be text") };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["id"], "request-3");
+        let result = &value["result"];
+        assert!(result["installed"].is_boolean());
+        assert!(result["version"].is_string() || result["version"].is_null());
+        assert!(result["service_exists"].is_boolean());
+        assert!(result["running"].is_boolean());
+        assert!(result["config_exists"].is_boolean());
+        assert_eq!(result["config_path"], SING_BOX_CONFIG_PATH);
+    }
+
     #[test]
-    fn unsupported_command_and_invalid_status_params_return_json_rpc_errors() {
+    fn singbox_status_parsers_report_version_and_systemd_state() {
+        assert_eq!(
+            parse_sing_box_version("sing-box version 1.12.0\nEnvironment: go1.24"),
+            Some("1.12.0".into())
+        );
+        assert_eq!(parse_sing_box_version("unexpected output"), None);
+        assert_eq!(parse_systemd_service_status("LoadState=loaded\nActiveState=active\n"), (true, true));
+        assert_eq!(parse_systemd_service_status("LoadState=loaded\nActiveState=inactive\n"), (true, false));
+        assert_eq!(
+            parse_systemd_service_status("LoadState=not-found\nActiveState=inactive\n"),
+            (false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_command_and_invalid_status_params_return_json_rpc_errors() {
         let collector = Collector::default();
         let started = Instant::now();
         for (method, params, code) in [
             ("not.registered", serde_json::json!({}), -32601),
             ("agent.status", serde_json::json!({"extra": true}), -32602),
+            ("singbox.status", serde_json::json!({"extra": true}), -32602),
         ] {
-            let reply = command_response("request-2", method, &params, &collector, 1, started);
+            let reply = command_response("request-2", method, &params, &collector, 1, started).await;
             let Message::Text(text) = reply else { panic!("command error must be text") };
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(value["id"], "request-2");

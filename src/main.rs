@@ -382,6 +382,17 @@ async fn session(
                                         Err(_) => Some(command::busy_response(id)),
                                     },
                                     Some(Err(error)) => Some(error),
+                                    None if rpc.method == "singbox.config.get" && rpc.params.as_object().is_some_and(|values| values.is_empty()) => {
+                                        let request_id = id.to_owned();
+                                        let reply_tx = result_tx.clone();
+                                        tokio::spawn(async move {
+                                            let reply = command::config_get_response(&request_id).await;
+                                            if reply_tx.send(reply).await.is_err() {
+                                                eprintln!("command id={request_id} method=singbox.config.get response queue closed");
+                                            }
+                                        });
+                                        None
+                                    }
                                     None => Some(command::respond(
                                         id,
                                         &rpc.method,
@@ -872,6 +883,7 @@ mod tests {
             serde_json::json!([
                 "agent.status",
                 "singbox.status",
+                "singbox.config.get",
                 "singbox.start",
                 "singbox.stop",
                 "singbox.restart",

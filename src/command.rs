@@ -8,8 +8,15 @@ use crate::collect::Collector;
 use crate::singbox::{ControlAction, ControlError};
 
 /// Agent 在 hello 中声明的内置命令白名单。
-pub const CAPABILITIES: &[&str] =
-    &["agent.status", "singbox.status", "singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"];
+pub const CAPABILITIES: &[&str] = &[
+    "agent.status",
+    "singbox.status",
+    "singbox.config.get",
+    "singbox.start",
+    "singbox.stop",
+    "singbox.restart",
+    "singbox.reload",
+];
 const CONTROL_FAILED_CODE: i64 = -32000;
 const CONTROL_TIMEOUT_CODE: i64 = -32001;
 const CONTROL_BUSY_CODE: i64 = -32002;
@@ -59,6 +66,20 @@ pub async fn control_response(id: &str, action: ControlAction) -> Message {
     control_result(id, result)
 }
 
+pub async fn config_get_response(id: &str) -> Message {
+    let started = Instant::now();
+    let result = crate::singbox::config_get().await;
+    eprintln!(
+        "command id={id} method=singbox.config.get success={} elapsed_ms={}",
+        result.is_ok(),
+        started.elapsed().as_millis()
+    );
+    match result {
+        Ok(value) => command_result(id, value),
+        Err(message) => command_error(id, CONTROL_FAILED_CODE, &message),
+    }
+}
+
 fn control_result(id: &str, result: Result<Value, ControlError>) -> Message {
     match result {
         Ok(value) => command_result(id, value),
@@ -91,6 +112,7 @@ pub async fn respond(
             command_result(id, crate::singbox::status().await)
         }
         "singbox.status" => command_error(id, -32602, "singbox.status 不接收参数"),
+        "singbox.config.get" => command_error(id, -32602, "singbox.config.get 不接收参数"),
         _ => command_error(id, -32601, "不支持的命令方法"),
     }
 }
@@ -181,6 +203,7 @@ mod tests {
             ("not.registered", json!({}), -32601),
             ("agent.status", json!({"extra": true}), -32602),
             ("singbox.status", json!({"extra": true}), -32602),
+            ("singbox.config.get", json!({"extra": true}), -32602),
         ] {
             let reply = respond("request-3", method, &params, &collector, 1, started).await;
             let Message::Text(text) = reply else { panic!("命令错误必须是文本帧") };

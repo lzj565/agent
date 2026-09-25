@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use std::{fs::File, io::Read, time::UNIX_EPOCH};
 
 use serde_json::Value;
 use tokio::process::Command;
@@ -14,6 +15,50 @@ const CONFIG_PATH: &str = "/etc/sing-box/config.json";
 const SING_BOX_SERVICE: &str = "sing-box.service";
 const STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONFIG_BYTES: usize = 32 * 1024;
+const MAX_CONFIG_RESPONSE_BYTES: usize = 60 * 1024;
+
+/// 在阻塞线程中读取固定配置，限制原文和编码后响应的大小。
+pub async fn config_get() -> Result<Value, String> {
+    tokio::task::spawn_blocking(|| read_config_at(Path::new(CONFIG_PATH)))
+        .await
+        .map_err(|_| "读取 sing-box 配置失败".to_owned())?
+}
+
+fn read_config_at(path: &Path) -> Result<Value, String> {
+    let file = File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "sing-box 配置文件不存在".to_owned(),
+        _ => "无法读取 sing-box 配置文件".to_owned(),
+    })?;
+    let metadata = file.metadata().map_err(|_| "无法读取 sing-box 配置文件信息".to_owned())?;
+    if !metadata.is_file() {
+        return Err("sing-box 配置路径不是普通文件".to_owned());
+    }
+    if metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return Err("sing-box 配置文件超过 32 KiB 限制".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取 sing-box 配置文件".to_owned())?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err("sing-box 配置文件超过 32 KiB 限制".to_owned());
+    }
+    let size_bytes = bytes.len();
+    let content = String::from_utf8(bytes).map_err(|_| "sing-box 配置文件不是 UTF-8 文本".to_owned())?;
+    let modified_at =
+        metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    let result = serde_json::json!({
+        "content": content,
+        "size_bytes": size_bytes,
+        "modified_at": modified_at,
+        "config_path": CONFIG_PATH,
+    });
+    if result.to_string().len() > MAX_CONFIG_RESPONSE_BYTES {
+        return Err("sing-box 配置编码后超过 WebSocket 响应限制".to_owned());
+    }
+    Ok(result)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlAction {
@@ -205,6 +250,44 @@ fn parse_systemd_service_status(output: &str) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_config_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "monitor-agent-config-get-{}-{}",
+            std::process::id(),
+            TEST_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn config_get_reads_exact_bytes_and_reports_metadata() {
+        let path = test_config_path();
+        std::fs::write(&path, b"").unwrap();
+        let result = read_config_at(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result["content"], "");
+        assert_eq!(result["size_bytes"], 0);
+        assert!(result["modified_at"].as_u64().is_some());
+        assert_eq!(result["config_path"], CONFIG_PATH);
+    }
+
+    #[test]
+    fn config_get_rejects_missing_oversize_invalid_utf8_and_encoded_oversize() {
+        let path = test_config_path();
+        assert!(read_config_at(&path).unwrap_err().contains("不存在"));
+        for (bytes, expected) in [
+            (vec![b'a'; MAX_CONFIG_BYTES + 1], "超过 32 KiB"),
+            (vec![0xff], "不是 UTF-8"),
+            (vec![0; MAX_CONFIG_BYTES], "WebSocket 响应限制"),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_config_at(&path).unwrap_err().contains(expected));
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
 
     #[test]
     fn control_actions_have_fixed_methods_and_systemctl_verbs() {

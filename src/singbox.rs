@@ -13,6 +13,8 @@ const SING_BOX_PATH: &str = "/opt/monitor/sing-box";
 const SING_BOX_LIB_DIR: &str = "/opt/monitor";
 const CONFIG_PATH: &str = "/etc/sing-box/config.json";
 const SING_BOX_SERVICE: &str = "sing-box.service";
+const OPENRC_SERVICE: &str = "sing-box";
+const OPENRC_SERVICE_FILE: &str = "/etc/init.d/sing-box";
 const STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONFIG_BYTES: usize = 32 * 1024;
@@ -87,14 +89,52 @@ impl ControlAction {
             Self::Reload => "singbox.reload",
         }
     }
+}
 
-    fn systemctl_verb(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Restart => "restart",
-            Self::Reload => "reload",
-        }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceManager {
+    Systemd,
+    OpenRc,
+}
+
+impl ServiceManager {
+    fn current() -> Self {
+        let configured = std::env::var("MONITOR_INIT").ok();
+        service_manager_from(
+            configured.as_deref(),
+            Path::new("/run/openrc/softlevel").exists(),
+            Path::new("/run/systemd/system").exists(),
+        )
+    }
+}
+
+fn service_manager_from(
+    configured: Option<&str>,
+    openrc_active: bool,
+    systemd_active: bool,
+) -> ServiceManager {
+    match configured {
+        Some("openrc") => ServiceManager::OpenRc,
+        Some("systemd") => ServiceManager::Systemd,
+        _ if openrc_active && !systemd_active => ServiceManager::OpenRc,
+        _ => ServiceManager::Systemd,
+    }
+}
+
+fn service_action_command(
+    manager: ServiceManager,
+    action: ControlAction,
+) -> (&'static str, [&'static str; 2]) {
+    let verb = match (manager, action) {
+        (ServiceManager::OpenRc, ControlAction::Reload) => "restart",
+        (_, ControlAction::Start) => "start",
+        (_, ControlAction::Stop) => "stop",
+        (_, ControlAction::Restart) => "restart",
+        (_, ControlAction::Reload) => "reload",
+    };
+    match manager {
+        ServiceManager::Systemd => ("systemctl", [verb, SING_BOX_SERVICE]),
+        ServiceManager::OpenRc => ("rc-service", [OPENRC_SERVICE, verb]),
     }
 }
 
@@ -104,9 +144,9 @@ pub enum ControlError {
     OutcomeUnknown(String),
 }
 
-/// 查询本机 sing-box 安装、systemd 服务和配置文件状态。
+/// 查询本机 sing-box 安装、init 服务和配置文件状态。
 pub async fn status() -> Value {
-    let service_state = systemd_service_state().await.unwrap_or((false, false));
+    let service_state = service_state(ServiceManager::current()).await.unwrap_or((false, false));
     snapshot(service_state).await
 }
 
@@ -125,7 +165,7 @@ async fn snapshot((service_exists, running): (bool, bool)) -> Value {
     })
 }
 
-/// 固定服务名执行控制操作；超时后无法确认 systemd 是否已经接收并完成操作。
+/// 固定服务名执行控制操作；超时后无法确认服务管理器是否已经完成操作。
 pub async fn control(action: ControlAction) -> Result<Value, ControlError> {
     match tokio::time::timeout(CONTROL_COMMAND_TIMEOUT, control_inner(action)).await {
         Ok(result) => result,
@@ -134,30 +174,29 @@ pub async fn control(action: ControlAction) -> Result<Value, ControlError> {
 }
 
 async fn control_inner(action: ControlAction) -> Result<Value, ControlError> {
+    let manager = ServiceManager::current();
     let (service_exists, running) =
-        systemd_service_state().await.map_err(|message| ControlError::Failed(message.into()))?;
+        service_state(manager).await.map_err(|message| ControlError::Failed(message.into()))?;
     check_preconditions(action, service_exists, running, Path::new(CONFIG_PATH).is_file())?;
 
-    let mut command = Command::new("systemctl");
-    command
-        .args([action.systemctl_verb(), SING_BOX_SERVICE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| ControlError::Failed("无法启动 systemctl".into()))?;
+    let (program, args) = service_action_command(manager, action);
+    let mut command = Command::new(program);
+    command.args(args).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| ControlError::Failed(format!("无法启动 {program}")))?;
     let exit = child
         .wait()
         .await
-        .map_err(|_| ControlError::OutcomeUnknown("无法确认 systemctl 是否完成服务操作".into()))?;
+        .map_err(|_| ControlError::OutcomeUnknown("无法确认服务管理器是否完成服务操作".into()))?;
     if !exit.success() {
         return Err(ControlError::Failed(format!(
-            "systemctl {} {} 失败（退出码 {}）",
-            action.systemctl_verb(),
-            SING_BOX_SERVICE,
+            "{} {} {} 失败（退出码 {}）",
+            program,
+            args[0],
+            args[1],
             exit.code().map_or_else(|| "信号终止".to_owned(), |code| code.to_string())
         )));
     }
-    let service_state = systemd_service_state()
+    let service_state = service_state(manager)
         .await
         .map_err(|_| ControlError::OutcomeUnknown("服务操作已提交，但无法确认当前状态".into()))?;
     Ok(snapshot(service_state).await)
@@ -170,13 +209,13 @@ fn check_preconditions(
     config_exists: bool,
 ) -> Result<(), ControlError> {
     if !service_exists {
-        return Err(ControlError::Failed("sing-box.service 不存在".into()));
+        return Err(ControlError::Failed("sing-box 服务不存在".into()));
     }
     if action != ControlAction::Stop && !config_exists {
         return Err(ControlError::Failed(format!("配置文件 {CONFIG_PATH} 不存在")));
     }
     if action == ControlAction::Reload && !running {
-        return Err(ControlError::Failed("sing-box.service 当前未运行，无法 reload".into()));
+        return Err(ControlError::Failed("sing-box 服务当前未运行，无法 reload".into()));
     }
     Ok(())
 }
@@ -204,6 +243,28 @@ async fn systemd_service_state() -> Result<(bool, bool), &'static str> {
         return Err("无法查询 systemd 服务状态");
     }
     Ok(parse_systemd_service_status(&String::from_utf8_lossy(&output.stdout)))
+}
+
+async fn service_state(manager: ServiceManager) -> Result<(bool, bool), &'static str> {
+    match manager {
+        ServiceManager::Systemd => systemd_service_state().await,
+        ServiceManager::OpenRc => openrc_service_state().await,
+    }
+}
+
+async fn openrc_service_state() -> Result<(bool, bool), &'static str> {
+    let service_file_exists = Path::new(OPENRC_SERVICE_FILE).is_file();
+    if !service_file_exists {
+        return Ok((false, false));
+    }
+    let Some(output) = bounded_command("rc-service", &[OPENRC_SERVICE, "status"], None).await else {
+        return Err("无法查询 OpenRC 服务状态");
+    };
+    Ok(parse_openrc_service_status(service_file_exists, output.status.success()))
+}
+
+fn parse_openrc_service_status(service_file_exists: bool, status_succeeded: bool) -> (bool, bool) {
+    (service_file_exists, service_file_exists && status_succeeded)
 }
 
 /// 通过固定程序和参数执行本地查询，并在超时后终止子进程。
@@ -290,18 +351,34 @@ mod tests {
     }
 
     #[test]
-    fn control_actions_have_fixed_methods_and_systemctl_verbs() {
-        for (method, action, verb) in [
-            ("singbox.start", ControlAction::Start, "start"),
-            ("singbox.stop", ControlAction::Stop, "stop"),
-            ("singbox.restart", ControlAction::Restart, "restart"),
-            ("singbox.reload", ControlAction::Reload, "reload"),
+    fn control_actions_have_fixed_methods_and_init_commands() {
+        for (method, action, systemd_verb, openrc_verb) in [
+            ("singbox.start", ControlAction::Start, "start", "start"),
+            ("singbox.stop", ControlAction::Stop, "stop", "stop"),
+            ("singbox.restart", ControlAction::Restart, "restart", "restart"),
+            ("singbox.reload", ControlAction::Reload, "reload", "restart"),
         ] {
             assert_eq!(ControlAction::from_method(method), Some(action));
             assert_eq!(action.method(), method);
-            assert_eq!(action.systemctl_verb(), verb);
+            assert_eq!(
+                service_action_command(ServiceManager::Systemd, action),
+                ("systemctl", [systemd_verb, SING_BOX_SERVICE])
+            );
+            assert_eq!(
+                service_action_command(ServiceManager::OpenRc, action),
+                ("rc-service", [OPENRC_SERVICE, openrc_verb])
+            );
         }
         assert_eq!(ControlAction::from_method("shell.exec"), None);
+    }
+
+    #[test]
+    fn configured_init_manager_wins_and_legacy_installations_are_detected() {
+        assert_eq!(service_manager_from(Some("openrc"), false, true), ServiceManager::OpenRc);
+        assert_eq!(service_manager_from(Some("systemd"), true, false), ServiceManager::Systemd);
+        assert_eq!(service_manager_from(None, true, false), ServiceManager::OpenRc);
+        assert_eq!(service_manager_from(None, true, true), ServiceManager::Systemd);
+        assert_eq!(service_manager_from(None, false, false), ServiceManager::Systemd);
     }
 
     #[test]
@@ -311,7 +388,7 @@ mod tests {
         {
             assert_eq!(
                 check_preconditions(action, false, false, true),
-                Err(ControlError::Failed("sing-box.service 不存在".into()))
+                Err(ControlError::Failed("sing-box 服务不存在".into()))
             );
         }
         assert!(check_preconditions(ControlAction::Stop, true, false, false).is_ok());
@@ -341,5 +418,12 @@ mod tests {
             parse_systemd_service_status("LoadState=not-found\nActiveState=inactive\n"),
             (false, false)
         );
+    }
+
+    #[test]
+    fn openrc_service_state_requires_our_service_file() {
+        assert_eq!(parse_openrc_service_status(false, true), (false, false));
+        assert_eq!(parse_openrc_service_status(true, true), (true, true));
+        assert_eq!(parse_openrc_service_status(true, false), (true, false));
     }
 }

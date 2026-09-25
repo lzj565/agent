@@ -38,6 +38,6 @@ jobs:
           sparse-checkout: scripts
       - run: cargo build
       - run: |
-          curl -fsSL -o monitor-hub https://github.com/monitor-probe/monitor/releases/latest/download/monitor-hub-x86_64-unknown-linux-musl
+          curl -fsSL -o monitor-hub https://github.com/lzj565/monitor/releases/latest/download/monitor-hub-x86_64-unknown-linux-musl
           chmod +x monitor-hub
       - run: hub/scripts/e2e.sh ./monitor-hub target/debug/monitor-agent

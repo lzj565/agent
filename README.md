@@ -24,7 +24,9 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 `/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
 安装命令需要以 root 执行，安装后的 systemd / OpenRC 服务也以 root 运行。
 安装脚本也会把 sing-box 二进制和 `libcronet.so` 运行库安装到 `/opt/monitor`，路径分别是
-`/opt/monitor/sing-box` 和 `/opt/monitor/libcronet.so`。升级时更新，卸载时删除；不会自动配置或运行 sing-box。
+`/opt/monitor/sing-box` 和 `/opt/monitor/libcronet.so`。首次安装会在 `/etc/sing-box/config.json`
+写入最小配置（已有配置保留并校验），使用独立的 `sing-box` 系统账户创建服务、启用开机启动并运行。
+卸载会移除安装器创建的服务和二进制，但保留配置。初始配置没有 inbound，因此服务运行后不会监听代理端口。
 
 ## 运行
 

@@ -5,9 +5,14 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::collect::Collector;
+use crate::singbox::{ControlAction, ControlError};
 
 /// Agent 在 hello 中声明的内置命令白名单。
-pub const CAPABILITIES: &[&str] = &["agent.status", "singbox.status"];
+pub const CAPABILITIES: &[&str] =
+    &["agent.status", "singbox.status", "singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"];
+const CONTROL_FAILED_CODE: i64 = -32000;
+const CONTROL_TIMEOUT_CODE: i64 = -32001;
+const CONTROL_BUSY_CODE: i64 = -32002;
 
 /// 生成与请求 ID 对应的 JSON-RPC 成功响应。
 fn command_result(id: &str, result: Value) -> Message {
@@ -25,6 +30,41 @@ fn command_error(id: &str, code: i64, message: &str) -> Message {
         .to_string()
         .into(),
     )
+}
+
+/// 控制命令在占用执行许可前先校验参数，避免错误请求阻塞其他操作。
+pub fn control_request(id: &str, method: &str, params: &Value) -> Option<Result<ControlAction, Message>> {
+    let action = ControlAction::from_method(method)?;
+    Some(if params.as_object().is_some_and(|values| values.is_empty()) {
+        Ok(action)
+    } else {
+        Err(command_error(id, -32602, &format!("{} 不接收参数", action.method())))
+    })
+}
+
+pub fn busy_response(id: &str) -> Message {
+    command_error(id, CONTROL_BUSY_CODE, "sing-box 服务操作正在进行")
+}
+
+pub async fn control_response(id: &str, action: ControlAction) -> Message {
+    let started = Instant::now();
+    let result = crate::singbox::control(action).await;
+    // 记录关联 ID、方法和耗时，便于按 Monitor 的命令记录定位本地操作。
+    eprintln!(
+        "command id={id} method={} success={} elapsed_ms={}",
+        action.method(),
+        result.is_ok(),
+        started.elapsed().as_millis()
+    );
+    control_result(id, result)
+}
+
+fn control_result(id: &str, result: Result<Value, ControlError>) -> Message {
+    match result {
+        Ok(value) => command_result(id, value),
+        Err(ControlError::Failed(message)) => command_error(id, CONTROL_FAILED_CODE, &message),
+        Err(ControlError::OutcomeUnknown(message)) => command_error(id, CONTROL_TIMEOUT_CODE, &message),
+    }
 }
 
 /// 按白名单分派命令；参数错误或未知方法只返回错误帧，不结束 WebSocket 会话。
@@ -60,6 +100,47 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn control_requests_validate_methods_and_params_before_running() {
+        for method in ["singbox.start", "singbox.stop", "singbox.restart", "singbox.reload"] {
+            let action = control_request("control-1", method, &json!({})).unwrap().unwrap();
+            assert_eq!(action.method(), method);
+            let error = control_request("control-1", method, &json!({"extra": true})).unwrap().unwrap_err();
+            let Message::Text(text) = error else { panic!("命令错误必须是文本帧") };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["id"], "control-1");
+            assert_eq!(value["error"]["code"], -32602);
+        }
+        assert!(control_request("control-1", "shell.exec", &json!({})).is_none());
+    }
+
+    #[test]
+    fn control_outcomes_use_distinct_json_rpc_error_codes() {
+        let cases = [
+            (control_result("control-2", Ok(json!({"running": true}))), "result", None),
+            (
+                control_result("control-2", Err(ControlError::Failed("操作失败".into()))),
+                "error",
+                Some(CONTROL_FAILED_CODE),
+            ),
+            (
+                control_result("control-2", Err(ControlError::OutcomeUnknown("结果未知".into()))),
+                "error",
+                Some(CONTROL_TIMEOUT_CODE),
+            ),
+            (busy_response("control-2"), "error", Some(CONTROL_BUSY_CODE)),
+        ];
+        for (reply, field, code) in cases {
+            let Message::Text(text) = reply else { panic!("命令响应必须是文本帧") };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(value["id"], "control-2");
+            assert!(value.get(field).is_some());
+            if let Some(code) = code {
+                assert_eq!(value["error"]["code"], code);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn agent_status_returns_process_and_collection_details() {

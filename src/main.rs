@@ -4,6 +4,7 @@ mod collect;
 mod command;
 mod singbox;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
@@ -15,7 +16,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -206,6 +207,8 @@ async fn main() -> Result<()> {
         if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
     );
     let mut wait = 0u64;
+    // 重连后沿用同一执行许可，避免旧连接的服务操作与新连接下发的操作重叠。
+    let control_gate = Arc::new(Semaphore::new(1));
 
     loop {
         // Set by `session` once the handshake completes, so a connect that
@@ -213,8 +216,16 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) =
-            session(&url, &args.token, &mut collector, args.interval, process_started, &mut connected).await
+        if let Err(e) = session(
+            &url,
+            &args.token,
+            &mut collector,
+            args.interval,
+            process_started,
+            &control_gate,
+            &mut connected,
+        )
+        .await
         {
             eprintln!("session ended: {e:#}");
         }
@@ -287,6 +298,7 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     process_started: Instant,
+    control_gate: &Arc<Semaphore>,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
@@ -355,17 +367,34 @@ async fn session(
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if let Some(id) = rpc.id.as_deref() {
-                                let reply = command::respond(
-                                    id,
-                                    &rpc.method,
-                                    &rpc.params,
-                                    collector,
-                                    interval,
-                                    process_started,
-                                )
-                                .await;
-                                if result_tx.send(reply).await.is_err() {
-                                    break Err(anyhow!("command response queue closed"));
+                                let reply = match command::control_request(id, &rpc.method, &rpc.params) {
+                                    Some(Ok(action)) => match control_gate.clone().try_acquire_owned() {
+                                        Ok(permit) => {
+                                            let request_id = id.to_owned();
+                                            let reply_tx = result_tx.clone();
+                                            tokio::spawn(async move {
+                                                let reply = command::control_response(&request_id, action).await;
+                                                drop(permit);
+                                                let _ = reply_tx.send(reply).await;
+                                            });
+                                            None
+                                        }
+                                        Err(_) => Some(command::busy_response(id)),
+                                    },
+                                    Some(Err(error)) => Some(error),
+                                    None => Some(command::respond(
+                                        id,
+                                        &rpc.method,
+                                        &rpc.params,
+                                        collector,
+                                        interval,
+                                        process_started,
+                                    ).await),
+                                };
+                                if let Some(reply) = reply {
+                                    if result_tx.send(reply).await.is_err() {
+                                        break Err(anyhow!("command response queue closed"));
+                                    }
                                 }
                             } else if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
@@ -838,6 +867,16 @@ mod tests {
     fn hello_advertises_supported_commands_without_changing_facts() {
         let hello = hello_params(serde_json::json!({"hostname": "node-a"}));
         assert_eq!(hello["hostname"], "node-a");
-        assert_eq!(hello["capabilities"], serde_json::json!(["agent.status", "singbox.status"]));
+        assert_eq!(
+            hello["capabilities"],
+            serde_json::json!([
+                "agent.status",
+                "singbox.status",
+                "singbox.start",
+                "singbox.stop",
+                "singbox.restart",
+                "singbox.reload"
+            ])
+        );
     }
 }

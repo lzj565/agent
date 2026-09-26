@@ -192,7 +192,7 @@ fn create_candidate(path: &Path, content: &[u8], file_mode: Option<FileMode>) ->
         let mut file = match options.open(&candidate) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err("无法创建 sing-box 临时配置".into()),
+            Err(error) => return Err(format!("无法创建 sing-box 临时配置：{error}")),
         };
         let created = (|| {
             file.write_all(content).map_err(|_| "无法写入 sing-box 临时配置".to_owned())?;

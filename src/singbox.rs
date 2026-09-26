@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rustix::fs::{fchmod, fchown, Gid, Mode, Uid};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -690,23 +691,69 @@ pub enum ControlError {
 
 /// 查询本机 sing-box 安装、init 服务和配置文件状态。
 pub async fn status() -> Value {
-    let service_state = service_state(ServiceManager::current()).await.unwrap_or((false, false));
-    snapshot(service_state).await
+    let service_state = service_state(ServiceManager::current()).await;
+    let known = service_state.is_ok();
+    snapshot(service_state.unwrap_or((false, false)), known).await
 }
 
-async fn snapshot((service_exists, running): (bool, bool)) -> Value {
+async fn snapshot((service_exists, running): (bool, bool), service_state_known: bool) -> Value {
     let installed = Path::new(SING_BOX_PATH)
         .metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
     let version = if installed { sing_box_version().await } else { None };
+    let config_metadata =
+        tokio::task::spawn_blocking(|| config_metadata_at(Path::new(CONFIG_PATH))).await.ok().flatten();
     serde_json::json!({
         "installed": installed,
         "version": version,
         "service_exists": service_exists,
         "running": running,
+        "service_state_known": service_state_known,
         "config_exists": Path::new(CONFIG_PATH).is_file(),
+        "config_sha256": config_metadata.as_ref().map(|metadata| metadata.sha256.as_str()),
+        "config_updated_at": config_metadata.as_ref().and_then(|metadata| metadata.modified_at),
         "config_path": CONFIG_PATH,
     })
+}
+
+struct ConfigMetadata {
+    sha256: String,
+    modified_at: Option<u64>,
+}
+
+fn config_metadata_at(path: &Path) -> Option<ConfigMetadata> {
+    let mut file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return None;
+    }
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    let mut hasher = Sha256::new();
+    let mut read_total = 0_usize;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total.checked_add(read)?;
+        if read_total > MAX_CONFIG_BYTES {
+            return None;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let digits = b"0123456789abcdef";
+    let mut sha256 = String::with_capacity(64);
+    for byte in digest {
+        sha256.push(digits[(byte >> 4) as usize] as char);
+        sha256.push(digits[(byte & 0x0f) as usize] as char);
+    }
+    Some(ConfigMetadata { sha256, modified_at })
 }
 
 /// 固定服务名执行控制操作；超时后无法确认服务管理器是否已经完成操作。
@@ -743,7 +790,7 @@ async fn control_inner(action: ControlAction) -> Result<Value, ControlError> {
     let service_state = service_state(manager)
         .await
         .map_err(|_| ControlError::OutcomeUnknown("服务操作已提交，但无法确认当前状态".into()))?;
-    Ok(snapshot(service_state).await)
+    Ok(snapshot(service_state, true).await)
 }
 
 fn check_preconditions(
@@ -1105,6 +1152,16 @@ mod tests {
             Some("1.12.0".into())
         );
         assert_eq!(parse_sing_box_version("unexpected output"), None);
+    }
+
+    #[test]
+    fn config_metadata_hashes_bytes_without_returning_the_content() {
+        let path = test_config_path();
+        std::fs::write(&path, b"{}").unwrap();
+        let metadata = config_metadata_at(&path).unwrap();
+        assert_eq!(metadata.sha256, "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a");
+        assert!(metadata.modified_at.is_some());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

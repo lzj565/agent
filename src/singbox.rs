@@ -168,7 +168,7 @@ fn config_file_mode(path: &Path) -> Result<FileMode, String> {
     Ok(FileMode {
         uid: Uid::from_raw(metadata.uid()),
         gid: Gid::from_raw(metadata.gid()),
-        mode: Mode::from_raw_mode((metadata.mode() & 0o777) as u16),
+        mode: Mode::from_raw_mode((metadata.mode() & 0o777) as _),
     })
 }
 

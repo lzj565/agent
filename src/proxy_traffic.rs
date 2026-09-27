@@ -53,13 +53,12 @@ pub struct Collector {
     channel: Channel,
 }
 
-impl Default for Collector {
-    fn default() -> Self {
-        Self { channel: Endpoint::from_static("http://127.0.0.1:9001").connect_lazy() }
-    }
-}
-
 impl Collector {
+    pub fn new(port: u16) -> Self {
+        let endpoint = Endpoint::from_shared(endpoint_uri(port)).expect("validated API port");
+        Self { channel: endpoint.connect_lazy() }
+    }
+
     pub async fn collect(&self) -> Result<Snapshot> {
         let mut grpc = tonic::client::Grpc::new(self.channel.clone());
         grpc.ready().await.map_err(|e| anyhow!("StatsService channel is not ready: {e}"))?;
@@ -73,6 +72,10 @@ impl Collector {
             .map_err(|status: Status| anyhow!("QueryStats failed: {status}"))?;
         snapshot(response.into_inner().stat)
     }
+}
+
+fn endpoint_uri(port: u16) -> String {
+    format!("http://{}", crate::api_config::listen_address(port))
 }
 
 fn snapshot(stats: Vec<Stat>) -> Result<Snapshot> {
@@ -97,4 +100,15 @@ fn snapshot(stats: Vec<Stat>) -> Result<Snapshot> {
         }
     }
     Ok(Snapshot { users, inbounds })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collector_uses_the_configured_local_api_port() {
+        assert_eq!(endpoint_uri(9002), "http://127.0.0.1:9002");
+        assert_eq!(endpoint_uri(9005), "http://127.0.0.1:9005");
+    }
 }

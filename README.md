@@ -21,7 +21,8 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 ```
 
 安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
-`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
+`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。sing-box
+V2Ray API 端口也保存在这里的 `SINGBOX_API_PORT`，只绑定 `127.0.0.1`，升级时会继续复用。
 
 ## 运行
 

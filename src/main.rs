@@ -1,5 +1,6 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
+mod api_config;
 mod collect;
 mod proxy_traffic;
 mod singbox;
@@ -23,6 +24,49 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use collect::Collector;
 use proxy_traffic::Collector as ProxyTrafficCollector;
 use singbox::Manager;
+
+/// Small installer-only commands. Keeping JSON and `/proc` handling in this
+/// binary avoids adding jq, Python, or other runtime dependencies to nodes.
+fn internal_command(args: &[String]) -> Option<i32> {
+    if args.first().map(String::as_str) != Some("internal") {
+        return None;
+    }
+    let result = match args.get(1).map(String::as_str) {
+        Some("api-port-from-config") if args.len() == 3 => {
+            match std::fs::read_to_string(&args[2])
+                .map_err(|e| e.to_string())
+                .and_then(|content| api_config::port_from_config(&content))
+            {
+                Ok(Some(port)) => {
+                    println!("{port}");
+                    return Some(0);
+                }
+                Ok(None) => return Some(3),
+                Err(error) => Err(error),
+            }
+        }
+        Some("set-api-port-in-config") if args.len() == 4 => {
+            let port = api_config::parse_port(&args[3]).ok_or_else(|| "invalid API port".to_owned());
+            port.and_then(|port| api_config::set_config_file_port(std::path::Path::new(&args[2]), port))
+        }
+        Some("tcp-port-listening") if args.len() == 3 => {
+            let port = api_config::parse_port(&args[2]).ok_or_else(|| "invalid API port".to_owned());
+            match port.and_then(api_config::tcp_port_listening) {
+                Ok(true) => return Some(0),
+                Ok(false) => return Some(1),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Err("invalid internal command".to_owned()),
+    };
+    match result {
+        Ok(()) => Some(0),
+        Err(error) => {
+            eprintln!("monitor-agent internal command: {error}");
+            Some(2)
+        }
+    }
+}
 
 struct Args {
     server: String,
@@ -180,7 +224,12 @@ fn remaining(last_frame: Instant) -> Duration {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    let cli = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(code) = internal_command(&cli) {
+        std::process::exit(code);
+    }
     let args = parse_args()?;
+    let api_port = api_config::port_from_env().map_err(anyhow::Error::msg)?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
     // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
@@ -199,7 +248,7 @@ async fn main() -> Result<()> {
         if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
     );
     let mut wait = 0u64;
-    let manager = Manager::default();
+    let manager = Manager::with_api_port(api_port);
 
     loop {
         // Set by `session` once the handshake completes, so a connect that
@@ -208,7 +257,8 @@ async fn main() -> Result<()> {
         // doubling.
         let mut connected = None;
         if let Err(e) =
-            session(&url, &args.token, &mut collector, args.interval, &mut connected, &manager).await
+            session(&url, &args.token, &mut collector, args.interval, &mut connected, &manager, api_port)
+                .await
         {
             eprintln!("session ended: {e:#}");
         }
@@ -284,6 +334,7 @@ async fn session(
     interval: u64,
     connected: &mut Option<Instant>,
     manager: &Manager,
+    api_port: u16,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -329,7 +380,7 @@ async fn session(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut traffic_ticker = tokio::time::interval(PROXY_TRAFFIC_INTERVAL);
     traffic_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let traffic_collector = ProxyTrafficCollector::default();
+    let traffic_collector = ProxyTrafficCollector::new(api_port);
     let mut traffic_error_reported = false;
 
     let result = loop {

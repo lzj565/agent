@@ -17,6 +17,7 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 pub struct Manager {
     binary: PathBuf,
     config: PathBuf,
+    api_port: u16,
     service: ServiceManager,
     write_lock: Arc<Mutex<()>>,
 }
@@ -135,13 +136,33 @@ struct Output {
 
 impl Default for Manager {
     fn default() -> Self {
-        Self::new("/opt/monitor/sing-box", "/etc/sing-box/config.json", ServiceManager::detect())
+        Self::new(
+            "/opt/monitor/sing-box",
+            "/etc/sing-box/config.json",
+            ServiceManager::detect(),
+            crate::api_config::DEFAULT_API_PORT,
+        )
     }
 }
 
 impl Manager {
-    fn new(binary: impl Into<PathBuf>, config: impl Into<PathBuf>, service: ServiceManager) -> Self {
-        Self { binary: binary.into(), config: config.into(), service, write_lock: Arc::new(Mutex::new(())) }
+    pub fn with_api_port(api_port: u16) -> Self {
+        Self::new("/opt/monitor/sing-box", "/etc/sing-box/config.json", ServiceManager::detect(), api_port)
+    }
+
+    fn new(
+        binary: impl Into<PathBuf>,
+        config: impl Into<PathBuf>,
+        service: ServiceManager,
+        api_port: u16,
+    ) -> Self {
+        Self {
+            binary: binary.into(),
+            config: config.into(),
+            api_port,
+            service,
+            write_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn execute(&self, action: &str, params: &Value) -> Result<Value, String> {
@@ -209,7 +230,8 @@ impl Manager {
 
     async fn check_config(&self, content: &str) -> Result<(), String> {
         size(content)?;
-        let temp = self.write_temp(content).await?;
+        let content = crate::api_config::set_config_port(content, self.api_port)?;
+        let temp = self.write_temp(&content).await?;
         let result = self.check_file(&temp).await;
         let _ = fs::remove_file(temp).await;
         result
@@ -218,7 +240,8 @@ impl Manager {
     async fn apply_config(&self, content: &str) -> Result<(), String> {
         size(content)?;
         let _guard = self.write_lock.lock().await;
-        let temp = self.write_temp(content).await?;
+        let content = crate::api_config::set_config_port(content, self.api_port)?;
+        let temp = self.write_temp(&content).await?;
         let result = self.apply_temp(&temp).await;
         let _ = fs::remove_file(temp).await;
         result
@@ -385,17 +408,28 @@ mod tests {
                 InitSystem::OpenRc => (dir.join("rc-service"), format!("#!/bin/sh\necho \"$*\" >> '{0}/service.log'\ncase \"$2\" in restart) if test -e '{0}/fail-once'; then rm '{0}/fail-once'; exit 1; fi; test ! -e '{0}/fail';; status) test ! -e '{0}/inactive';; esac\n", dir.display())),
                 InitSystem::Unsupported => unreachable!(),
             };
-            std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in version) echo 'sing-box version 1.0';; check) case \"$(cat \"$3\")\" in *invalid*) echo 'invalid config' >&2; exit 1;; esac;; esac\n").unwrap();
+            std::fs::write(&binary, format!("#!/bin/sh\ncase \"$1\" in version) echo 'sing-box version 1.0';; check) cat \"$3\" >> '{0}/checked.log'; case \"$(cat \"$3\")\" in *invalid*) echo 'invalid config' >&2; exit 1;; esac;; esac\n", dir.display())).unwrap();
             std::fs::write(&service, script).unwrap();
             for path in [&binary, &service] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let config = dir.join("config.json");
             std::fs::write(&config, "old").unwrap();
-            Self { manager: Manager::new(binary, config, ServiceManager { init, program: service }), dir }
+            Self {
+                manager: Manager::new(binary, config, ServiceManager { init, program: service }, 9002),
+                dir,
+            }
         }
         fn config(&self) -> String {
             std::fs::read_to_string(&self.manager.config).unwrap()
+        }
+
+        fn candidate(marker: &str) -> String {
+            json!({
+                "experimental": {"v2ray_api": {"listen": "127.0.0.1:9001", "stats": {"enabled": true}}},
+                "marker": marker
+            })
+            .to_string()
         }
     }
     impl Drop for Fixture {
@@ -408,24 +442,31 @@ mod tests {
     async fn get_check_apply_and_rollback() {
         let f = Fixture::new();
         assert_eq!(f.manager.read_config().await.unwrap(), "old");
-        assert!(f.manager.check_config("new").await.is_ok());
-        assert!(f.manager.check_config("invalid").await.is_err());
+        assert!(f.manager.check_config(&Fixture::candidate("new")).await.is_ok());
+        assert!(f.manager.check_config(&Fixture::candidate("invalid")).await.is_err());
         assert_eq!(f.config(), "old");
-        assert!(f.manager.apply_config("invalid").await.is_err());
+        assert!(f.manager.apply_config(&Fixture::candidate("invalid")).await.is_err());
         assert_eq!(f.config(), "old");
-        f.manager.apply_config("new").await.unwrap();
-        assert_eq!(f.config(), "new");
+        f.manager.apply_config(&Fixture::candidate("new")).await.unwrap();
+        let applied: Value = serde_json::from_str(&f.config()).unwrap();
+        assert_eq!(applied["experimental"]["v2ray_api"]["listen"], "127.0.0.1:9002");
+        assert_eq!(applied["marker"], "new");
+        let checked = std::fs::read_to_string(f.dir.join("checked.log")).unwrap();
+        assert!(checked.contains("127.0.0.1:9002"), "check must validate the node-local port");
         std::fs::write(f.dir.join("fail-once"), "").unwrap();
-        let err = f.manager.apply_config("next").await.unwrap_err();
+        let err = f.manager.apply_config(&Fixture::candidate("next")).await.unwrap_err();
         assert!(err.contains("rollback: succeeded"));
-        assert_eq!(f.config(), "new");
+        let restored: Value = serde_json::from_str(&f.config()).unwrap();
+        assert_eq!(restored["marker"], "new");
         std::fs::write(f.dir.join("fail"), "").unwrap();
-        let err = f.manager.apply_config("next").await.unwrap_err();
+        let err = f.manager.apply_config(&Fixture::candidate("next")).await.unwrap_err();
         assert!(err.contains("rollback: failed"));
-        assert_eq!(f.config(), "new");
+        let restored: Value = serde_json::from_str(&f.config()).unwrap();
+        assert_eq!(restored["marker"], "new");
         std::fs::remove_file(f.dir.join("fail")).unwrap();
         assert!(f.manager.apply_config(&"x".repeat(MAX_CONFIG + 1)).await.is_err());
-        assert_eq!(f.config(), "new");
+        let restored: Value = serde_json::from_str(&f.config()).unwrap();
+        assert_eq!(restored["marker"], "new");
     }
 
     #[tokio::test]
@@ -438,7 +479,7 @@ mod tests {
             "singbox.config.apply",
             "singbox.restart",
         ] {
-            let params = json!({"content":"new"});
+            let params = json!({"content":Fixture::candidate("new")});
             let result = f.manager.execute(action, &params).await;
             assert!(result.is_ok(), "{action}: {result:?}");
         }
@@ -474,7 +515,7 @@ mod tests {
         assert_eq!(calls, "sing-box restart\nsing-box status\nsing-box status\n");
 
         std::fs::write(f.dir.join("fail-once"), "").unwrap();
-        let err = f.manager.apply_config("new").await.unwrap_err();
+        let err = f.manager.apply_config(&Fixture::candidate("new")).await.unwrap_err();
         assert!(err.contains("rollback: succeeded"));
         assert_eq!(f.config(), "old");
         let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
@@ -497,6 +538,7 @@ mod tests {
             f.manager.binary.clone(),
             f.manager.config.clone(),
             ServiceManager { init: InitSystem::Unsupported, program: PathBuf::new() },
+            9002,
         );
         assert_eq!(manager.read_config().await.unwrap(), "old");
         assert!(manager.restart().await.unwrap_err().contains("UNSUPPORTED_INIT_SYSTEM"));

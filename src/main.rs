@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod proxy_traffic;
 mod singbox;
 
 use std::time::Duration;
@@ -20,6 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use collect::Collector;
+use proxy_traffic::Collector as ProxyTrafficCollector;
 use singbox::Manager;
 
 struct Args {
@@ -272,6 +274,7 @@ const MAX_MESSAGE: usize = 6 * 1024 * 1024 + 16 * 1024;
 /// Staying under the hub's own timeout makes the agent give up first, bounding
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
+const PROXY_TRAFFIC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One connection: handshake, then report until the socket closes.
 async fn session(
@@ -324,12 +327,34 @@ async fn session(
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut traffic_ticker = tokio::time::interval(PROXY_TRAFFIC_INTERVAL);
+    traffic_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let traffic_collector = ProxyTrafficCollector::default();
+    let mut traffic_error_reported = false;
 
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
+            }
+            _ = traffic_ticker.tick() => {
+                let reading = tokio::time::timeout(Duration::from_secs(3), traffic_collector.collect()).await;
+                match reading {
+                    Ok(Ok(snapshot)) => {
+                        traffic_error_reported = false;
+                        if let Err(e) = send(&mut ws, notify("proxy.traffic", serde_json::to_value(snapshot)?), remaining(last_frame)).await { break Err(e); }
+                    }
+                    Ok(Err(e)) if !traffic_error_reported => {
+                        eprintln!("sing-box traffic stats unavailable: {e:#}");
+                        traffic_error_reported = true;
+                    }
+                    Err(_) if !traffic_error_reported => {
+                        eprintln!("sing-box traffic stats unavailable: query timed out after 3s");
+                        traffic_error_reported = true;
+                    }
+                    _ => {}
+                }
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate

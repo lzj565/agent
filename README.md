@@ -1,6 +1,6 @@
 # monitor-agent
 
-[monitor](https://github.com/monitor-probe/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
+[monitor](https://github.com/lzj565/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
 
 静态链接单文件，无运行时依赖，常驻内存数 MB。
 

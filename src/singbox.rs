@@ -439,7 +439,8 @@ mod tests {
             "singbox.restart",
         ] {
             let params = json!({"content":"new"});
-            assert!(f.manager.execute(action, &params).await.is_ok(), "{action}");
+            let result = f.manager.execute(action, &params).await;
+            assert!(result.is_ok(), "{action}: {result:?}");
         }
         assert!(f.manager.execute("singbox.stop", &json!({})).await.unwrap_err().contains("unknown action"));
     }

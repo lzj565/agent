@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod singbox;
 
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use collect::Collector;
+use singbox::Manager;
 
 struct Args {
     server: String,
@@ -195,6 +197,7 @@ async fn main() -> Result<()> {
         if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
     );
     let mut wait = 0u64;
+    let manager = Manager::default();
 
     loop {
         // Set by `session` once the handshake completes, so a connect that
@@ -202,7 +205,9 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) =
+            session(&url, &args.token, &mut collector, args.interval, &mut connected, &manager).await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -254,7 +259,8 @@ const DIAL_FALLBACK: Duration = Duration::from_secs(5);
 /// The hub sends one kind of message, a probe list a few hundred bytes long.
 /// Tungstenite's 64 MiB default would hand the peer this process's entire
 /// memory budget.
-const MAX_MESSAGE: usize = 64 * 1024;
+// A 1 MiB UTF-8 config can expand to six JSON bytes per input byte.
+const MAX_MESSAGE: usize = 6 * 1024 * 1024 + 16 * 1024;
 
 /// How long the agent waits for any frame from the hub before giving up.
 ///
@@ -274,6 +280,7 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     connected: &mut Option<Instant>,
+    manager: &Manager,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -339,6 +346,17 @@ async fn session(
                 last_frame = Instant::now();
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if value.get("type").and_then(serde_json::Value::as_str) == Some("command") {
+                                let manager = manager.clone();
+                                let tx = result_tx.clone();
+                                tokio::spawn(async move {
+                                    let response = command_result(&manager, &value).await;
+                                    let _ = tx.send(Message::Text(response.to_string().into())).await;
+                                });
+                                continue;
+                            }
+                        }
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
@@ -361,6 +379,45 @@ async fn session(
         handle.abort();
     }
     result
+}
+
+async fn command_result(manager: &Manager, command: &serde_json::Value) -> serde_json::Value {
+    let id = command.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let action = command.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
+    let params = command.get("params").unwrap_or(&serde_json::Value::Null);
+    match manager.execute(action, params).await {
+        Ok(result) => serde_json::json!({"type":"command_result", "id":id, "ok":true, "result":result}),
+        Err(message) => {
+            let code = if matches!(
+                action,
+                "singbox.status"
+                    | "singbox.config.get"
+                    | "singbox.config.check"
+                    | "singbox.config.apply"
+                    | "singbox.restart"
+            ) {
+                "SINGBOX_ERROR"
+            } else {
+                "UNKNOWN_ACTION"
+            };
+            serde_json::json!({"type":"command_result", "id":id, "ok":false, "error":{"code":code, "message":message}})
+        }
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn command_keeps_id_and_reports_unknown_action() {
+    let result = command_result(
+        &Manager::default(),
+        &serde_json::json!({
+            "type": "command", "id": "request-123", "action": "singbox.unknown", "params": {}
+        }),
+    )
+    .await;
+    assert_eq!(result["id"], "request-123");
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["code"], "UNKNOWN_ACTION");
 }
 
 /// Opens the TCP connection to the hub, trying its addresses in turn.

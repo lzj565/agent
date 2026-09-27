@@ -17,8 +17,114 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 pub struct Manager {
     binary: PathBuf,
     config: PathBuf,
-    systemctl: PathBuf,
+    service: ServiceManager,
     write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitSystem {
+    Systemd,
+    OpenRc,
+    Unsupported,
+}
+
+#[derive(Clone)]
+struct ServiceManager {
+    init: InitSystem,
+    program: PathBuf,
+}
+
+impl ServiceManager {
+    fn detect() -> Self {
+        let systemd_marker = Path::new("/run/systemd/system").exists();
+        let openrc_marker = Path::new("/run/openrc/softlevel").exists();
+        let systemctl = executable("systemctl");
+        let rc_service = executable("rc-service");
+        let init =
+            detect_init_system(systemd_marker, systemctl.is_some(), openrc_marker, rc_service.is_some());
+        let program = match init {
+            InitSystem::Systemd => systemctl,
+            InitSystem::OpenRc => rc_service,
+            InitSystem::Unsupported => None,
+        }
+        .unwrap_or_default();
+        Self { init, program }
+    }
+
+    async fn restart(&self) -> Result<(), String> {
+        let args = match self.init {
+            InitSystem::Systemd => ["restart", "sing-box.service"],
+            InitSystem::OpenRc => ["sing-box", "restart"],
+            InitSystem::Unsupported => {
+                return Err(
+                    "UNSUPPORTED_INIT_SYSTEM: unsupported init system: only systemd and OpenRC are supported"
+                        .into(),
+                );
+            }
+        };
+        let output =
+            run_command(&self.program, &args).await.map_err(|e| format!("SINGBOX_RESTART_FAILED: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "SINGBOX_RESTART_FAILED: service restart failed: {}",
+                limited(&output.stderr)
+            ));
+        }
+        if self.is_running().await? {
+            Ok(())
+        } else {
+            Err("SINGBOX_RESTART_FAILED: sing-box is not running after restart".into())
+        }
+    }
+
+    async fn is_running(&self) -> Result<bool, String> {
+        let args = match self.init {
+            InitSystem::Systemd => ["is-active", "--quiet", "sing-box.service"],
+            InitSystem::OpenRc => ["sing-box", "status", ""],
+            InitSystem::Unsupported => {
+                return Err(
+                    "UNSUPPORTED_INIT_SYSTEM: unsupported init system: only systemd and OpenRC are supported"
+                        .into(),
+                );
+            }
+        };
+        let args: &[&str] = if self.init == InitSystem::OpenRc { &args[..2] } else { &args };
+        run_command(&self.program, args)
+            .await
+            .map(|o| o.status.success())
+            .map_err(|e| format!("SINGBOX_STATUS_FAILED: {e}"))
+    }
+}
+
+fn detect_init_system(
+    systemd_marker: bool,
+    systemctl: bool,
+    openrc_marker: bool,
+    rc_service: bool,
+) -> InitSystem {
+    if systemd_marker && systemctl {
+        InitSystem::Systemd
+    } else if openrc_marker && rc_service {
+        InitSystem::OpenRc
+    } else {
+        InitSystem::Unsupported
+    }
+}
+
+fn executable(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(name)).find(|path| {
+        std::fs::metadata(path).is_ok_and(|m| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                m.is_file() && m.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                m.is_file()
+            }
+        })
+    })
 }
 
 struct Output {
@@ -29,18 +135,13 @@ struct Output {
 
 impl Default for Manager {
     fn default() -> Self {
-        Self::new("/opt/monitor/sing-box", "/etc/sing-box/config.json", "systemctl")
+        Self::new("/opt/monitor/sing-box", "/etc/sing-box/config.json", ServiceManager::detect())
     }
 }
 
 impl Manager {
-    fn new(binary: impl Into<PathBuf>, config: impl Into<PathBuf>, systemctl: impl Into<PathBuf>) -> Self {
-        Self {
-            binary: binary.into(),
-            config: config.into(),
-            systemctl: systemctl.into(),
-            write_lock: Arc::new(Mutex::new(())),
-        }
+    fn new(binary: impl Into<PathBuf>, config: impl Into<PathBuf>, service: ServiceManager) -> Self {
+        Self { binary: binary.into(), config: config.into(), service, write_lock: Arc::new(Mutex::new(())) }
     }
 
     pub async fn execute(&self, action: &str, params: &Value) -> Result<Value, String> {
@@ -89,7 +190,7 @@ impl Manager {
         } else {
             String::new()
         };
-        Ok(json!({"installed": installed, "running": self.is_running().await, "version": version}))
+        Ok(json!({"installed": installed, "running": self.service.is_running().await?, "version": version}))
     }
 
     async fn read_config(&self) -> Result<String, String> {
@@ -197,53 +298,43 @@ impl Manager {
     }
 
     async fn restart_service(&self) -> Result<(), String> {
-        let output = self.output(&self.systemctl, &["restart", "sing-box.service"]).await?;
-        if !output.status.success() {
-            return Err(format!("systemctl restart failed: {}", limited(&output.stderr)));
-        }
-        if self.is_running().await {
-            Ok(())
-        } else {
-            Err("sing-box.service is not active after restart".into())
-        }
-    }
-
-    async fn is_running(&self) -> bool {
-        self.output(&self.systemctl, &["is-active", "--quiet", "sing-box.service"])
-            .await
-            .is_ok_and(|o| o.status.success())
+        self.service.restart().await
     }
 
     async fn output(&self, program: &Path, args: &[&str]) -> Result<Output, String> {
-        use tokio::io::AsyncReadExt;
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("{}: {e}", program.display()))?;
-        let stdout = child.stdout.take().ok_or("missing stdout")?;
-        let stderr = child.stderr.take().ok_or("missing stderr")?;
-        let run = async {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let mut stdout = stdout.take((MAX_OUTPUT + 1) as u64);
-            let mut stderr = stderr.take((MAX_OUTPUT + 1) as u64);
-            let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-            a.map_err(|e| e.to_string())?;
-            b.map_err(|e| e.to_string())?;
-            if out.len() > MAX_OUTPUT || err.len() > MAX_OUTPUT {
-                child.kill().await.map_err(|e| e.to_string())?;
-                return Err(format!("{} output exceeds 4 KiB", program.display()));
-            }
-            let status = child.wait().await.map_err(|e| e.to_string())?;
-            Ok(Output { status, stdout: out, stderr: err })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(30), run)
-            .await
-            .map_err(|_| format!("{} timed out", program.display()))?
+        run_command(program, args).await
     }
+}
+
+async fn run_command(program: &Path, args: &[&str]) -> Result<Output, String> {
+    use tokio::io::AsyncReadExt;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let stderr = child.stderr.take().ok_or("missing stderr")?;
+    let run = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut stdout = stdout.take((MAX_OUTPUT + 1) as u64);
+        let mut stderr = stderr.take((MAX_OUTPUT + 1) as u64);
+        let (a, b) = tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+        a.map_err(|e| e.to_string())?;
+        b.map_err(|e| e.to_string())?;
+        if out.len() > MAX_OUTPUT || err.len() > MAX_OUTPUT {
+            child.kill().await.map_err(|e| e.to_string())?;
+            return Err(format!("{} output exceeds 4 KiB", program.display()));
+        }
+        let status = child.wait().await.map_err(|e| e.to_string())?;
+        Ok(Output { status, stdout: out, stderr: err })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .map_err(|_| format!("{} timed out", program.display()))?
 }
 
 fn content(params: &Value) -> Result<&str, String> {
@@ -278,6 +369,10 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_init(InitSystem::Systemd)
+        }
+
+        fn with_init(init: InitSystem) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "singbox-agent-test-{}-{}",
                 std::process::id(),
@@ -285,15 +380,19 @@ mod tests {
             ));
             std::fs::create_dir(&dir).unwrap();
             let binary = dir.join("sing-box");
-            let service = dir.join("systemctl");
+            let (service, script) = match init {
+                InitSystem::Systemd => (dir.join("systemctl"), format!("#!/bin/sh\necho \"$*\" >> '{0}/service.log'\ncase \"$1\" in restart) if test -e '{0}/fail-once'; then rm '{0}/fail-once'; exit 1; fi; test ! -e '{0}/fail';; is-active) test ! -e '{0}/inactive';; esac\n", dir.display())),
+                InitSystem::OpenRc => (dir.join("rc-service"), format!("#!/bin/sh\necho \"$*\" >> '{0}/service.log'\ncase \"$2\" in restart) if test -e '{0}/fail-once'; then rm '{0}/fail-once'; exit 1; fi; test ! -e '{0}/fail';; status) test ! -e '{0}/inactive';; esac\n", dir.display())),
+                InitSystem::Unsupported => unreachable!(),
+            };
             std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in version) echo 'sing-box version 1.0';; check) case \"$(cat \"$3\")\" in *invalid*) echo 'invalid config' >&2; exit 1;; esac;; esac\n").unwrap();
-            std::fs::write(&service, format!("#!/bin/sh\ncase \"$1\" in restart) if test -e '{0}/fail-once'; then rm '{0}/fail-once'; exit 1; fi; test ! -e '{0}/fail';; is-active) test ! -e '{0}/inactive';; esac\n", dir.display())).unwrap();
+            std::fs::write(&service, script).unwrap();
             for path in [&binary, &service] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let config = dir.join("config.json");
             std::fs::write(&config, "old").unwrap();
-            Self { manager: Manager::new(binary, config, service), dir }
+            Self { manager: Manager::new(binary, config, ServiceManager { init, program: service }), dir }
         }
         fn config(&self) -> String {
             std::fs::read_to_string(&self.manager.config).unwrap()
@@ -355,5 +454,51 @@ mod tests {
         std::fs::write(f.dir.join("inactive"), "").unwrap();
         assert_eq!(f.manager.status().await.unwrap()["running"], false);
         assert!(f.manager.restart().await.is_err());
+    }
+
+    #[test]
+    fn detects_supported_init_systems_in_order() {
+        assert_eq!(detect_init_system(true, true, true, true), InitSystem::Systemd);
+        assert_eq!(detect_init_system(false, false, true, true), InitSystem::OpenRc);
+        assert_eq!(detect_init_system(false, true, false, true), InitSystem::Unsupported);
+        assert_eq!(detect_init_system(true, false, true, false), InitSystem::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn openrc_uses_native_restart_and_status_commands_for_apply_and_rollback() {
+        let f = Fixture::with_init(InitSystem::OpenRc);
+        f.manager.service.restart().await.unwrap();
+        assert_eq!(f.manager.status().await.unwrap()["running"], true);
+        let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
+        assert_eq!(calls, "sing-box restart\nsing-box status\nsing-box status\n");
+
+        std::fs::write(f.dir.join("fail-once"), "").unwrap();
+        let err = f.manager.apply_config("new").await.unwrap_err();
+        assert!(err.contains("rollback: succeeded"));
+        assert_eq!(f.config(), "old");
+        let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
+        assert!(calls.ends_with("sing-box restart\nsing-box restart\nsing-box status\n"));
+    }
+
+    #[tokio::test]
+    async fn systemd_uses_expected_service_commands() {
+        let f = Fixture::new();
+        f.manager.service.restart().await.unwrap();
+        assert_eq!(f.manager.status().await.unwrap()["running"], true);
+        let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
+        assert_eq!(calls, "restart sing-box.service\nis-active --quiet sing-box.service\nis-active --quiet sing-box.service\n");
+    }
+
+    #[tokio::test]
+    async fn unsupported_init_keeps_config_readable_but_rejects_service_actions() {
+        let f = Fixture::new();
+        let manager = Manager::new(
+            f.manager.binary.clone(),
+            f.manager.config.clone(),
+            ServiceManager { init: InitSystem::Unsupported, program: PathBuf::new() },
+        );
+        assert_eq!(manager.read_config().await.unwrap(), "old");
+        assert!(manager.restart().await.unwrap_err().contains("UNSUPPORTED_INIT_SYSTEM"));
+        assert!(manager.status().await.unwrap_err().contains("UNSUPPORTED_INIT_SYSTEM"));
     }
 }

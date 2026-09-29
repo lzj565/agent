@@ -138,7 +138,7 @@ impl Default for Manager {
     fn default() -> Self {
         Self::new(
             "/opt/monitor/sing-box",
-            "/etc/sing-box/config.json",
+            "/opt/monitor/config/sb.json",
             ServiceManager::detect(),
             crate::api_config::DEFAULT_API_PORT,
         )
@@ -147,7 +147,7 @@ impl Default for Manager {
 
 impl Manager {
     pub fn with_api_port(api_port: u16) -> Self {
-        Self::new("/opt/monitor/sing-box", "/etc/sing-box/config.json", ServiceManager::detect(), api_port)
+        Self::new("/opt/monitor/sing-box", "/opt/monitor/config/sb.json", ServiceManager::detect(), api_port)
     }
 
     fn new(

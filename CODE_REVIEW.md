@@ -7,7 +7,7 @@
 | --- | --- | --- | --- | --- |
 | 1 | 高 | `src/api_config.rs`：临时配置写入后才设置权限 | 创建时 0600；验证写入前权限和最终原权限保留 | 已完成 |
 | 2 | 中 | `src/singbox.rs`：只检查输入大小，转换后可能超过读取限制 | 转换后再次检查 1 MiB；超限不修改原配置，成功应用可读取 | 已完成 |
-| 3 | 高 | `src/main.rs`：远程命令无限 spawn，断线后排队任务仍执行 | 最多 4 个执行、16 个排队，超限返回 BUSY；断线丢弃未开始命令，已开始配置事务完成 | 待修复 |
+| 3 | 高 | `src/main.rs`：远程命令无限 spawn，断线后排队任务仍执行 | 最多 4 个执行、16 个排队，超限返回 BUSY；断线丢弃未开始命令，已开始配置事务完成 | 已完成 |
 | 4 | 高 | `src/main.rs`：代理流量查询占用网络循环最多 3 秒 | 单个后台任务、有界结果通道；API 超时不影响上报、心跳与命令，保留日志抑制 | 待修复 |
 | 5 | 中 | `src/collect.rs`：流量 epoch 只包含名称 | 纳入 ifindex，检测单网卡回退；覆盖同名重建、汇总掩盖回退和排序变化 | 待修复 |
 | 6 | 中 | `.github/workflows`：dev 推送无 CI，tag 发布无质量门禁 | CI 覆盖 dev，发布前通过 fmt、Clippy、测试 | 待修复 |
@@ -22,3 +22,5 @@
 - 最终要求：`cargo fmt --all --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`，Linux 专属行为需在 Linux 验证。未执行的检查不标记通过。
 
 - 第 2 项：Linux `cargo test --locked singbox::tests` 8/8 通过，格式检查通过；覆盖恰好 1 MiB 输入转换后超限、拒绝前不启动子进程、不修改原配置，以及应用后读取与临时文件清理。
+
+- 第 3 项：新增 `src/commands.rs`，全进程共享 4 个执行许可，每连接最多排队 16 条；完成结果等待发送期间仍占用许可。Linux 全套 43/43 测试、Clippy（-D warnings）、格式检查通过；覆盖 BUSY 与请求 ID、FIFO、取消等待、跨连接额度、断线完成应用及回滚。

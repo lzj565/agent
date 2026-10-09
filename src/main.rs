@@ -2,9 +2,11 @@
 
 mod api_config;
 mod collect;
+mod commands;
 mod proxy_traffic;
 mod singbox;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
@@ -16,7 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -249,6 +251,7 @@ async fn main() -> Result<()> {
     );
     let mut wait = 0u64;
     let manager = Manager::with_api_port(api_port);
+    let command_slots = Arc::new(Semaphore::new(commands::MAX_RUNNING));
 
     loop {
         // Set by `session` once the handshake completes, so a connect that
@@ -256,9 +259,16 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) =
-            session(&url, &args.token, &mut collector, args.interval, &mut connected, &manager, api_port)
-                .await
+        if let Err(e) = session(
+            &url,
+            &args.token,
+            &mut collector,
+            args.interval,
+            &mut connected,
+            &manager,
+            command_slots.clone(),
+        )
+        .await
         {
             eprintln!("session ended: {e:#}");
         }
@@ -334,7 +344,7 @@ async fn session(
     interval: u64,
     connected: &mut Option<Instant>,
     manager: &Manager,
-    api_port: u16,
+    command_slots: Arc<Semaphore>,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
     request
@@ -375,16 +385,18 @@ async fn session(
     send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
+    let mut commands = commands::CommandQueue::new(command_slots, manager.clone(), result_tx.clone());
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut traffic_ticker = tokio::time::interval(PROXY_TRAFFIC_INTERVAL);
     traffic_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let traffic_collector = ProxyTrafficCollector::new(api_port);
+    let traffic_collector = ProxyTrafficCollector::new(manager.api_port());
     let mut traffic_error_reported = false;
 
     let result = loop {
         tokio::select! {
+            _ = commands.start_next(), if commands.has_pending() => {}
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
@@ -424,12 +436,11 @@ async fn session(
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                             if value.get("type").and_then(serde_json::Value::as_str) == Some("command") {
-                                let manager = manager.clone();
-                                let tx = result_tx.clone();
-                                tokio::spawn(async move {
-                                    let response = command_result(&manager, &value).await;
-                                    let _ = tx.send(Message::Text(response.to_string().into())).await;
-                                });
+                                if let Err(response) = commands.submit(value) {
+                                    if let Err(e) = send(&mut ws, Message::Text(response.to_string().into()), remaining(last_frame)).await {
+                                        break Err(e);
+                                    }
+                                }
                                 continue;
                             }
                         }

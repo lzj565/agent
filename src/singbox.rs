@@ -146,6 +146,10 @@ impl Default for Manager {
 }
 
 impl Manager {
+    pub fn api_port(&self) -> u16 {
+        self.api_port
+    }
+
     pub fn with_api_port(api_port: u16) -> Self {
         Self::new("/opt/monitor/sing-box", "/opt/monitor/config/sb.json", ServiceManager::detect(), api_port)
     }
@@ -469,6 +473,57 @@ mod tests {
         assert!(f.manager.apply_config(&"x".repeat(MAX_CONFIG + 1)).await.is_err());
         let restored: Value = serde_json::from_str(&f.config()).unwrap();
         assert_eq!(restored["marker"], "new");
+    }
+
+    #[tokio::test]
+    async fn disconnect_finishes_started_apply_or_rollback_but_discards_waiting_commands() {
+        use crate::commands::{CommandQueue, MAX_RUNNING};
+        use tokio::sync::{mpsc, Semaphore};
+        for fail_restart in [false, true] {
+            let f = Fixture::new();
+            let script = format!(
+                "#!/bin/sh\ntouch '{0}/checking'\nwhile test -e '{0}/hold'; do sleep 0.01; done\n",
+                f.dir.display()
+            );
+            std::fs::write(&f.manager.binary, script).unwrap();
+            std::fs::write(f.dir.join("hold"), "").unwrap();
+            if fail_restart {
+                std::fs::write(f.dir.join("fail-once"), "").unwrap();
+            }
+            let slots = Arc::new(Semaphore::new(MAX_RUNNING));
+            let _held = slots.clone().acquire_many_owned((MAX_RUNNING - 1) as u32).await.unwrap();
+            let (tx, rx) = mpsc::channel(1);
+            let mut queue = CommandQueue::new(slots.clone(), f.manager.clone(), tx);
+            queue
+                .submit(json!({"id": 1, "action": "singbox.config.apply",
+                "params": {"content": Fixture::candidate("started")}}))
+                .unwrap();
+            queue
+                .submit(json!({"id": 2, "action": "singbox.config.apply",
+                "params": {"content": Fixture::candidate("must-not-run")}}))
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !f.dir.join("checking").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(queue);
+            drop(rx);
+            std::fs::remove_file(f.dir.join("hold")).unwrap();
+            let _done = tokio::time::timeout(std::time::Duration::from_secs(5), slots.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+            if fail_restart {
+                assert_eq!(f.config(), "old", "started rollback must finish after disconnect");
+            } else {
+                assert_eq!(serde_json::from_str::<Value>(&f.config()).unwrap()["marker"], "started");
+            }
+            let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
+            assert_eq!(calls.matches("restart").count(), if fail_restart { 2 } else { 1 });
+        }
     }
 
     #[tokio::test]

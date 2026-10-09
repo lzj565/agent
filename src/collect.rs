@@ -122,8 +122,8 @@ pub struct Metrics {
     /// Names the span over which `net_rx_total` and `net_tx_total` readings
     /// are comparable. The hub only tests it for equality, and a change makes
     /// it re-baseline rather than book the difference. It is the kernel's boot
-    /// id, which changes when the counters restart at zero, then `/` and a
-    /// digest of the interfaces summed: an interface joining the sum within one
+    /// id, then a digest of the interface names and indices and a reset serial.
+    /// An interface joining the sum within one
     /// boot -- a reclassified device, a changed `--iface` -- would otherwise
     /// have its lifetime bytes booked as traffic.
     pub boot_id: String,
@@ -201,7 +201,7 @@ impl Ifaces {
     }
 }
 
-/// See [`Metrics::boot_id`]. The names are sorted, since /proc/net/dev lists a
+/// See [`Metrics::boot_id`]. The identities are sorted, since /proc/net/dev lists a
 /// recreated interface in a new position without the set having changed, and
 /// hashed with FNV-1a, whose output no Rust release can alter.
 ///
@@ -212,15 +212,15 @@ impl Ifaces {
 /// Per-interface counters in the report, summed by the hub, would remove the
 /// loss; an offset kept here would not, as it dies with the process and takes the
 /// traffic of the downtime with it.
-fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
-    let mut names: Vec<&str> = names.collect();
+fn epoch<'a>(boot_id: &str, identities: impl Iterator<Item = (&'a str, u32)>, resets: u64) -> String {
+    let mut names: Vec<String> = identities.map(|(name, index)| format!("{name}:{index}")).collect();
     names.sort_unstable();
     // A newline cannot occur in an interface name, so no two sets join alike.
     let digest = names
         .join("\n")
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-    format!("{boot_id}/{digest:016x}")
+    format!("{boot_id}/{digest:016x}/{resets}")
 }
 
 #[derive(Default)]
@@ -230,6 +230,8 @@ pub struct Collector {
     /// When the last sample was taken, and each counted interface's counters.
     prev_net_at: Option<Instant>,
     prev_net: HashMap<String, (u64, u64)>,
+    prev_ifindices: HashMap<String, u32>,
+    net_resets: u64,
 }
 
 impl Collector {
@@ -277,9 +279,19 @@ impl Collector {
         let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
         let counted = self.counted(&dev);
         let (rx_total, tx_total) = totals(&counted);
-        let boot_id = epoch(
+        let identities: Vec<_> = counted
+            .iter()
+            .map(|(name, ..)| {
+                let index = read_trim(&format!("{SYS_NET}/{name}/ifindex"))
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                (*name, index)
+            })
+            .collect();
+        let boot_id = self.net_epoch(
             &read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
-            counted.iter().map(|(name, ..)| *name),
+            &counted,
+            &identities,
         );
         let (rx, tx) = self.net_rate(&counted, Instant::now());
         let (tcp, udp) = conn_counts();
@@ -343,6 +355,30 @@ impl Collector {
         self.prev_net_at = Some(now);
         self.prev_net = counted.iter().map(|(n, r, t)| ((*n).to_owned(), (*r, *t))).collect();
         rate
+    }
+
+    fn net_epoch(
+        &mut self,
+        boot_id: &str,
+        counted: &[(&str, u64, u64)],
+        identities: &[(&str, u32)],
+    ) -> String {
+        // A reset of one interface may be hidden by another interface's
+        // growth in the aggregate. Check each counter before summing.
+        if counted.iter().any(|(name, rx, tx)| {
+            self.prev_net.get(*name).is_some_and(|(old_rx, old_tx)| rx < old_rx || tx < old_tx)
+        }) {
+            self.net_resets = self.net_resets.wrapping_add(1);
+        }
+        for (name, index) in identities {
+            if self.prev_ifindices.get(*name).is_some_and(|old| old != index) {
+                // A same-name replacement can already have larger counters;
+                // neither those bytes nor a negative delta are a rate sample.
+                self.prev_net.remove(*name);
+            }
+        }
+        self.prev_ifindices = identities.iter().map(|(n, i)| ((*n).to_owned(), *i)).collect();
+        epoch(boot_id, identities.iter().copied(), self.net_resets)
     }
 }
 
@@ -1030,12 +1066,35 @@ mod tests {
     /// device the rules reclassify, a changed `--iface`.
     #[test]
     fn the_epoch_changes_whenever_the_summed_set_does() {
-        let e = |names: &[&str]| epoch("boot", names.iter().copied());
+        let e = |names: &[&str]| epoch("boot", names.iter().map(|name| (*name, 1)), 0);
         assert!(e(&["eth0"]).starts_with("boot/"), "a reboot still changes it");
         assert_ne!(e(&["eth0"]), e(&["eth0", "lxdbr0"]));
         assert_ne!(e(&["eth0"]), e(&["eth1"]));
         assert_ne!(e(&["eth0"]), e(&[]));
         assert_eq!(e(&["eth1", "eth0"]), e(&["eth0", "eth1"]), "listing order is not a different set");
+    }
+
+    #[test]
+    fn same_name_replacement_and_hidden_counter_resets_change_the_epoch() {
+        let mut c = Collector::default();
+        let t = Instant::now();
+        let ids = [("eth0", 2), ("eth1", 3)];
+        let initial = [("eth0", 1000, 1000), ("eth1", 1000, 1000)];
+        let first = c.net_epoch("boot", &initial, &ids);
+        c.net_rate(&initial, t);
+        let replaced = [("eth0", 9000, 9000), ("eth1", 1100, 1200)];
+        let second = c.net_epoch("boot", &replaced, &[("eth0", 4), ("eth1", 3)]);
+        assert_ne!(first, second, "same name with a new ifindex needs a fresh baseline");
+        assert_eq!(c.net_rate(&replaced, t + std::time::Duration::from_secs(1)), (100, 200));
+
+        let reset = [("eth0", 10, 10), ("eth1", 20000, 20000)];
+        assert!(totals(&reset).0 > totals(&replaced).0, "aggregate masks the reset");
+        let third = c.net_epoch("boot", &reset, &[("eth0", 4), ("eth1", 3)]);
+        assert_ne!(second, third);
+        c.net_rate(&reset, t + std::time::Duration::from_secs(2));
+        assert_eq!(third, c.net_epoch("boot", &reset, &[("eth1", 3), ("eth0", 4)]));
+        let tx_reset = [("eth0", 11, 1), ("eth1", 20001, 20001)];
+        assert_ne!(third, c.net_epoch("boot", &tx_reset, &[("eth0", 4), ("eth1", 3)]));
     }
 
     #[test]

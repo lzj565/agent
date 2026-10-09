@@ -413,6 +413,7 @@ dependencies = [
  "futures-util",
  "if-addrs",
  "prost",
+ "rand",
  "rustix",
  "rustls",
  "serde",

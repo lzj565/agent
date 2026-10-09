@@ -274,7 +274,7 @@ async fn main() -> Result<()> {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
-        tokio::time::sleep(Duration::from_secs(wait)).await;
+        tokio::time::sleep(Duration::from_millis(rand::random_range(reconnect_jitter(wait)))).await;
     }
 }
 
@@ -292,6 +292,16 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
     } else {
         (previous * 2).clamp(1, 60)
     }
+}
+
+/// Keep the exponential base separate from randomness. Applying jitter to
+/// the previous random delay would distort the backoff on subsequent retries.
+/// Millisecond precision spreads even the first reconnect after a hub restart;
+/// the capped retry still varies from 45 to 60 seconds instead of synchronising
+/// every node at exactly the ceiling.
+fn reconnect_jitter(base: u64) -> std::ops::RangeInclusive<u64> {
+    let millis = base.clamp(1, 60) * 1000;
+    (millis * 3 / 4).max(1000)..=(millis * 5 / 4).min(60_000)
 }
 
 /// Deadline covering every stage of establishing a connection: resolution,
@@ -864,6 +874,23 @@ mod tests {
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped too early to prove anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
+
+    #[test]
+    fn reconnect_jitter_spreads_retries_within_the_hard_limits() {
+        assert_eq!(reconnect_jitter(1), 1000..=1250);
+        assert_eq!(reconnect_jitter(2), 1500..=2500);
+        assert_eq!(reconnect_jitter(4), 3000..=5000);
+        assert_eq!(reconnect_jitter(60), 45_000..=60_000);
+        assert_eq!(reconnect_jitter(0), reconnect_jitter(1));
+        assert_eq!(reconnect_jitter(u64::MAX), reconnect_jitter(60));
+        for base in 1..=60 {
+            let range = reconnect_jitter(base);
+            assert!(*range.start() >= 1000 && *range.end() <= 60_000);
+            assert!(range.start() < range.end(), "jitter must remain effective at the ceiling");
+        }
+        let reset = reconnect_wait(60, Duration::from_secs(30));
+        assert_eq!(reconnect_jitter(reset), 1000..=1250, "stable sessions reset to a short delay");
     }
 
     #[test]

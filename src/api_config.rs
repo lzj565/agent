@@ -115,13 +115,9 @@ pub fn set_config_file_port(path: &Path, port: u16) -> Result<(), String> {
     let updated = set_config_port(&content, port)?;
     let metadata = std::fs::metadata(&path).map_err(|error| format!("stat {}: {error}", path.display()))?;
     let temp = path.with_extension(format!("json.api-port.{}", std::process::id()));
+    let mut file = private_config_file(&temp)?;
     let result = (|| {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|error| format!("create {}: {error}", temp.display()))?;
         file.write_all(updated.as_bytes()).map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
         std::fs::set_permissions(&temp, metadata.permissions()).map_err(|error| error.to_string())?;
@@ -134,9 +130,40 @@ pub fn set_config_file_port(path: &Path, port: u16) -> Result<(), String> {
     result
 }
 
+fn private_config_file(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_config_is_private_before_writing_and_replacement_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("api-config-permissions-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let temp = dir.join("private.json");
+        let file = private_config_file(&temp).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(private_config_file(&temp).is_err(), "must not overwrite an existing file");
+        drop(file);
+
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"inbounds":[]}"#).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        set_config_file_port(&config, 9002).unwrap();
+        assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(port_from_config(&std::fs::read_to_string(config).unwrap()).unwrap(), Some(9002));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn reads_legacy_api_port_and_ignores_invalid_addresses() {

@@ -5,7 +5,7 @@
 
 | 序号 | 优先级 | 问题与位置 | 修复方案与验收条件 | 状态 |
 | --- | --- | --- | --- | --- |
-| 1 | 高 | `src/api_config.rs`：临时配置写入后才设置权限 | 创建时 0600；验证写入前权限和最终原权限保留 | 待修复 |
+| 1 | 高 | `src/api_config.rs`：临时配置写入后才设置权限 | 创建时 0600；验证写入前权限和最终原权限保留 | 已完成 |
 | 2 | 中 | `src/singbox.rs`：只检查输入大小，转换后可能超过读取限制 | 转换后再次检查 1 MiB；超限不修改原配置，成功应用可读取 | 待修复 |
 | 3 | 高 | `src/main.rs`：远程命令无限 spawn，断线后排队任务仍执行 | 最多 4 个执行、16 个排队，超限返回 BUSY；断线丢弃未开始命令，已开始配置事务完成 | 待修复 |
 | 4 | 高 | `src/main.rs`：代理流量查询占用网络循环最多 3 秒 | 单个后台任务、有界结果通道；API 超时不影响上报、心跳与命令，保留日志抑制 | 待修复 |
@@ -17,5 +17,6 @@
 ## 验证记录
 
 - 初始工作区干净，main 基线：`cac7d3964ebaa98930808338add20508c677db85`。
-- 本机为 macOS，PATH 无 cargo；正在检查可用 Linux 构建环境。
+- 本机为 macOS，PATH 无 cargo；已建立独立 OrbStack Linux ARM64 Rust 容器，构建缓存位于容器 /tmp。
+- 第 1 项：Linux `cargo test --locked api_config::tests` 4/4 通过，`cargo fmt --all --check` 通过。创建失败不删除已有临时文件；替换后保留原权限。
 - 最终要求：`cargo fmt --all --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked`，Linux 专属行为需在 Linux 验证。未执行的检查不标记通过。

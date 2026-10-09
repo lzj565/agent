@@ -11,7 +11,7 @@
 | 4 | 高 | `src/main.rs`：代理流量查询占用网络循环最多 3 秒 | 单个后台任务、有界结果通道；API 超时不影响上报、心跳与命令，保留日志抑制 | 已完成 |
 | 5 | 中 | `src/collect.rs`：流量 epoch 只包含名称 | 纳入 ifindex，检测单网卡回退；覆盖同名重建、汇总掩盖回退和排序变化 | 已完成 |
 | 6 | 中 | `.github/workflows`：dev 推送无 CI，tag 发布无质量门禁 | CI 覆盖 dev，发布前通过 fmt、Clippy、测试 | 已完成 |
-| 7 | 优化 | `src/collect.rs`：同步采集阻塞单线程网络运行时 | 单个后台工作任务保持 Collector 状态、串行采样，无任务堆积；慢采集不阻塞网络 | 待修复 |
+| 7 | 优化 | `src/collect.rs`：同步采集阻塞单线程网络运行时 | 单个后台工作任务保持 Collector 状态、串行采样，无任务堆积；慢采集不阻塞网络 | 已完成 |
 | 8 | 优化 | `src/main.rs`：退避缺少随机抖动 | 加入随机偏移，总等待 1–60 秒；覆盖边界与稳定会话重置 | 待修复 |
 
 ## 验证记录
@@ -30,3 +30,5 @@
 - 第 5 项：Linux 采集相关 17/17 测试、fmt、Clippy 通过；epoch 增加 ifindex 与回退序号，同名新设备不继承旧速率基线；覆盖汇总仍增长时单网卡 RX/TX 回退、顺序变化不影响摘要。保持字段不变，hub 按不透明字符串比较；README 同步说明。
 
 - 第 6 项：actionlint v1.7.12 验证全部工作流通过；发布依赖链为 check → build → release。Linux 实际执行新增门禁：fmt、Clippy 通过，测试 46/46 通过。未 push，故没有远端 Actions 运行结果。
+
+- 第 7 项：新增 `src/metric_worker.rs`，全进程单独线程拥有 Collector，容量 1 的请求通道；网络循环每次仅等待一个采样 Future，未开始且已取消的请求跳过。Linux 全套 49/49、fmt、Clippy 通过；覆盖单线程状态保留、跨连接基线、有界队列、取消，以及真实 WebSocket 在阻塞采样时 500ms 内完成 Pong/命令回复。

@@ -3,6 +3,7 @@
 mod api_config;
 mod collect;
 mod commands;
+mod metric_worker;
 mod proxy_traffic;
 mod singbox;
 
@@ -239,7 +240,7 @@ async fn main() -> Result<()> {
     for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
     }
-    let mut collector = Collector::new(args.ifaces);
+    let collector = Collector::new(args.ifaces);
     // Reported once at startup: an interface summed twice otherwise shows only
     // as a total twice the real one. One listed in --iface but absent here,
     // such as a PPPoE link not yet dialled, is counted once it appears.
@@ -248,6 +249,7 @@ async fn main() -> Result<()> {
         "counting traffic on: {}",
         if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
     );
+    let collector = metric_worker::Worker::new(collector)?;
     let mut wait = 0u64;
     let manager = Manager::with_api_port(api_port);
     let command_slots = Arc::new(Semaphore::new(commands::MAX_RUNNING));
@@ -261,7 +263,7 @@ async fn main() -> Result<()> {
         if let Err(e) = session(
             &url,
             &args.token,
-            &mut collector,
+            &collector,
             args.interval,
             &mut connected,
             &manager,
@@ -338,7 +340,7 @@ const HUB_SILENCE: Duration = Duration::from_secs(90);
 async fn session(
     url: &str,
     token: &str,
-    collector: &mut Collector,
+    collector: &metric_worker::Worker,
     interval: u64,
     connected: &mut Option<Instant>,
     manager: &Manager,
@@ -361,7 +363,7 @@ async fn session(
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
     // Collected before dialing, as the v4 it reports decides which family is
     // tried first.
-    let facts = collector.facts();
+    let facts = collector.facts().await?;
     let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
     let connect = async {
         let stream = dial(&host, port, behind_nat).await?;
@@ -387,14 +389,26 @@ async fn session(
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let sampling = collector.collect();
+    tokio::pin!(sampling);
+    let mut collecting = false;
     let mut traffic = proxy_traffic::Worker::new(manager.api_port());
     let mut traffic_error_reported = false;
 
     let result = loop {
         tokio::select! {
             _ = commands.start_next(), if commands.has_pending() => {}
-            _ = ticker.tick() => {
-                let m = serde_json::to_value(collector.collect())?;
+            _ = ticker.tick(), if !collecting => {
+                collecting = true;
+            }
+            reading = &mut sampling, if collecting => {
+                let reading = match reading {
+                    Ok(reading) => reading,
+                    Err(e) => break Err(e),
+                };
+                let m = serde_json::to_value(reading)?;
+                collecting = false;
+                sampling.set(collector.collect());
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
             }
             Some(reading) = traffic.recv() => {
@@ -684,6 +698,99 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn slow_metrics_leave_the_websocket_responsive_without_starting_more_samples() {
+        struct SlowMetrics {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+            calls: Arc<std::sync::atomic::AtomicU32>,
+        }
+        impl metric_worker::Source for SlowMetrics {
+            fn facts(&self) -> collect::Facts {
+                Collector::default().facts()
+            }
+            fn collect(&mut self) -> collect::Metrics {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                    let _ = self.release.recv();
+                }
+                collect::Metrics { procs: n, ..collect::Metrics::default() }
+            }
+        }
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker = metric_worker::Worker::new(SlowMetrics {
+            entered: Some(entered),
+            release: wait,
+            calls: calls.clone(),
+        })
+        .unwrap();
+        let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/agent/ws", hub.local_addr().unwrap());
+        let clone = worker.clone();
+        let client = tokio::spawn(async move {
+            session(
+                &url,
+                "test-token",
+                &clone,
+                1,
+                &mut None,
+                &Manager::default(),
+                Arc::new(Semaphore::new(commands::MAX_RUNNING)),
+            )
+            .await
+        });
+        let (stream, _) = hub.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started).await.unwrap().unwrap();
+        ws.send(Message::Ping(vec![9].into())).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "command", "id": "slow-metrics",
+            "action": "unknown"})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let (mut pong, mut response) = (false, false);
+            while !pong || !response {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Pong(bytes) => pong = bytes.as_ref() == [9],
+                    Message::Text(text) => {
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        response |= value["id"] == "slow-metrics";
+                        assert_ne!(value["method"], "report", "sample is still blocked");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("blocking metric I/O must not block network messages");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["method"] == "report" {
+                        assert_eq!(value["params"]["procs"], 1);
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client).await.unwrap().unwrap().unwrap();
+        assert!(worker.collect().await.unwrap().procs >= 2, "worker state survives the session");
+    }
+
+    #[tokio::test]
     async fn a_stalled_stats_api_does_not_delay_reports_pongs_or_commands() {
         let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -693,7 +800,7 @@ mod tests {
             session(
                 &url,
                 "test-token",
-                &mut Collector::default(),
+                &metric_worker::Worker::new(Collector::default()).unwrap(),
                 1,
                 &mut None,
                 &manager,

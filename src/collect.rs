@@ -735,10 +735,9 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
 /// charge ext4's 5% root reserve to the user and show a fresh disk several
 /// percent full.
 ///
-/// Blocking, on the thread that also runs the reporting loop. [`SKIP_FSTYPES`]
-/// is what makes that safe: the mounts that hang in D state until a server
-/// answers -- nfs, cifs, ceph, fuse -- never reach this call. Removing an entry
-/// from that list would let a dead NAS freeze the agent, watchdog included.
+/// Blocking on the dedicated metrics worker. Remote filesystems are excluded
+/// both for local capacity semantics and to avoid occupying that worker while
+/// a remote server is unavailable. The network loop and watchdog run separately.
 fn disk_usage(mounts: &[String]) -> (u64, u64) {
     let mut total = 0u64;
     let mut used = 0u64;

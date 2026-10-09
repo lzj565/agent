@@ -24,7 +24,6 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use collect::Collector;
-use proxy_traffic::Collector as ProxyTrafficCollector;
 use singbox::Manager;
 
 /// Small installer-only commands. Keeping JSON and `/proc` handling in this
@@ -334,7 +333,6 @@ const MAX_MESSAGE: usize = 6 * 1024 * 1024 + 16 * 1024;
 /// Staying under the hub's own timeout makes the agent give up first, bounding
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
-const PROXY_TRAFFIC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One connection: handshake, then report until the socket closes.
 async fn session(
@@ -389,9 +387,7 @@ async fn session(
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut traffic_ticker = tokio::time::interval(PROXY_TRAFFIC_INTERVAL);
-    traffic_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let traffic_collector = ProxyTrafficCollector::new(manager.api_port());
+    let mut traffic = proxy_traffic::Worker::new(manager.api_port());
     let mut traffic_error_reported = false;
 
     let result = loop {
@@ -401,19 +397,14 @@ async fn session(
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
             }
-            _ = traffic_ticker.tick() => {
-                let reading = tokio::time::timeout(Duration::from_secs(3), traffic_collector.collect()).await;
+            Some(reading) = traffic.recv() => {
                 match reading {
-                    Ok(Ok(snapshot)) => {
+                    Ok(snapshot) => {
                         traffic_error_reported = false;
                         if let Err(e) = send(&mut ws, notify("proxy.traffic", serde_json::to_value(snapshot)?), remaining(last_frame)).await { break Err(e); }
                     }
-                    Ok(Err(e)) if !traffic_error_reported => {
+                    Err(e) if !traffic_error_reported => {
                         eprintln!("sing-box traffic stats unavailable: {e:#}");
-                        traffic_error_reported = true;
-                    }
-                    Err(_) if !traffic_error_reported => {
-                        eprintln!("sing-box traffic stats unavailable: query timed out after 3s");
                         traffic_error_reported = true;
                     }
                     _ => {}
@@ -454,6 +445,7 @@ async fn session(
                     }
                     // Ping included: tungstenite queues the pong itself and
                     // sends it on the next read; a manual reply would duplicate it.
+                    Some(Ok(Message::Close(_))) => break Ok(()),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => break Err(e.into()),
                     None => break Ok(()),
@@ -690,6 +682,61 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_stats_api_does_not_delay_reports_pongs_or_commands() {
+        let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/agent/ws", hub.local_addr().unwrap());
+        let manager = Manager::with_api_port(api.local_addr().unwrap().port());
+        let client = tokio::spawn(async move {
+            session(
+                &url,
+                "test-token",
+                &mut Collector::default(),
+                1,
+                &mut None,
+                &manager,
+                Arc::new(Semaphore::new(commands::MAX_RUNNING)),
+            )
+            .await
+        });
+        let (stream, _) = hub.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let (_stalled, _) = api.accept().await.unwrap();
+        ws.send(Message::Ping(vec![1, 2, 3].into())).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "command", "id": "still-responsive",
+            "action": "unknown"})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut reports, mut pong, mut response) = (0, false, false);
+            while reports < 2 || !pong || !response {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Pong(bytes) => pong = bytes.as_ref() == [1, 2, 3],
+                    Message::Text(text) => {
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if value["method"] == "report" {
+                            reports += 1;
+                        }
+                        if value["id"] == "still-responsive" {
+                            assert_eq!(value["error"]["code"], "UNKNOWN_ACTION");
+                            response = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("stats query must not block the WebSocket loop for its 3s timeout");
+        ws.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client).await.unwrap().unwrap().unwrap();
+    }
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {

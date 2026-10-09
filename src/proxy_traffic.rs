@@ -2,6 +2,7 @@
 //! lifetime counters. The hub owns all accumulation and reset semantics.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
@@ -13,6 +14,46 @@ use tonic_prost::ProstCodec;
 const QUERY_STATS: &str = "/v2ray.core.app.stats.command.StatsService/QueryStats";
 const INBOUND_UP: &str = ">>>traffic>>>uplink";
 const INBOUND_DOWN: &str = ">>>traffic>>>downlink";
+const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const INTERVAL: Duration = Duration::from_secs(5);
+
+/// One query at a time, with at most one queued result. Dropping a session
+/// cancels its worker, so reconnecting never accumulates polling loops.
+pub struct Worker {
+    results: tokio::sync::mpsc::Receiver<Result<Snapshot>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Worker {
+    pub fn new(port: u16) -> Self {
+        let collector = Collector::new(port);
+        let (tx, results) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let reading = tokio::time::timeout(QUERY_TIMEOUT, collector.collect())
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("query timed out after 3s")));
+                if tx.send(reading).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Self { results, task }
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<Snapshot>> {
+        self.results.recv().await
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct QueryStatsRequest {
@@ -110,5 +151,18 @@ mod tests {
     fn collector_uses_the_configured_local_api_port() {
         assert_eq!(endpoint_uri(9002), "http://127.0.0.1:9002");
         assert_eq!(endpoint_uri(9005), "http://127.0.0.1:9005");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_api_times_out_and_dropping_the_worker_stops_polling() {
+        let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut worker = Worker::new(api.local_addr().unwrap().port());
+        let (_stalled, _) = api.accept().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(4), worker.recv()).await.unwrap().unwrap();
+        assert!(result.unwrap_err().to_string().contains("timed out after 3s"));
+        let task = worker.task.abort_handle();
+        drop(worker);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "session drop must not leave a traffic worker running");
     }
 }

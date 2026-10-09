@@ -231,6 +231,7 @@ impl Manager {
     async fn check_config(&self, content: &str) -> Result<(), String> {
         size(content)?;
         let content = crate::api_config::set_config_port(content, self.api_port)?;
+        size(&content)?;
         let temp = self.write_temp(&content).await?;
         let result = self.check_file(&temp).await;
         let _ = fs::remove_file(temp).await;
@@ -241,6 +242,7 @@ impl Manager {
         size(content)?;
         let _guard = self.write_lock.lock().await;
         let content = crate::api_config::set_config_port(content, self.api_port)?;
+        size(&content)?;
         let temp = self.write_temp(&content).await?;
         let result = self.apply_temp(&temp).await;
         let _ = fs::remove_file(temp).await;
@@ -467,6 +469,30 @@ mod tests {
         assert!(f.manager.apply_config(&"x".repeat(MAX_CONFIG + 1)).await.is_err());
         let restored: Value = serde_json::from_str(&f.config()).unwrap();
         assert_eq!(restored["marker"], "new");
+    }
+
+    #[tokio::test]
+    async fn transformed_config_must_fit_the_read_limit_before_check_or_apply() {
+        let f = Fixture::new();
+        let overhead = json!({"padding": ""}).to_string().len();
+        let input = json!({"padding": "x".repeat(MAX_CONFIG - overhead)}).to_string();
+        assert_eq!(input.len(), MAX_CONFIG, "input itself meets the limit");
+        assert!(crate::api_config::set_config_port(&input, 9002).unwrap().len() > MAX_CONFIG);
+        assert!(f.manager.check_config(&input).await.unwrap_err().contains("exceeds 1 MiB"));
+        assert!(f.manager.apply_config(&input).await.unwrap_err().contains("exceeds 1 MiB"));
+        assert_eq!(f.config(), "old");
+        assert!(!f.dir.join("checked.log").exists(), "oversized output must not reach the subprocess");
+        assert!(!f.dir.join("service.log").exists(), "oversized output must not restart the service");
+
+        let input = Fixture::candidate("readable");
+        f.manager.apply_config(&input).await.unwrap();
+        let readback = f.manager.read_config().await.unwrap();
+        assert_eq!(readback, crate::api_config::set_config_port(&input, 9002).unwrap());
+        assert!(!std::fs::read_dir(&f.dir).unwrap().any(|e| {
+            let name = e.unwrap().file_name();
+            let name = name.to_string_lossy();
+            name.contains(".tmp.") || name.contains(".bak.")
+        }));
     }
 
     #[tokio::test]

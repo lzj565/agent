@@ -215,7 +215,7 @@ impl Manager {
         } else {
             "partial"
         };
-        json!({"target_reachability":reachability,"targets_checked":checked,"targets_total":total,"installed":installed,"managed":managed,"version":version,"running": managed && self.service("running").await.unwrap_or(false),"enabled":managed && self.service("enabled").await.unwrap_or(false),"revision":state.revision,"digest":if matches {state.digest}else{String::new()},"desired_running":state.run})
+        json!({"traffic":if self.root == std::path::Path::new("/opt/monitor") {crate::realm_traffic::snapshot()["status"].clone()} else {json!({})},"target_reachability":reachability,"targets_checked":checked,"targets_total":total,"installed":installed,"managed":managed,"version":version,"running": managed && self.service("running").await.unwrap_or(false),"enabled":managed && self.service("enabled").await.unwrap_or(false),"revision":state.revision,"digest":if matches {state.digest}else{String::new()},"desired_running":state.run})
     }
     async fn apply(&self, params: &Value) -> Result<Value, String> {
         if !self.owned().await || !self.root.join("realm").is_file() {
@@ -321,6 +321,39 @@ impl Manager {
                 Ok(json!({"valid":true}))
             }
             "realm.config.apply" => self.apply(params).await,
+            "realm.traffic.configure" => {
+                let state = self.state_read().await;
+                if !self.owned().await
+                    || params["revision"].as_u64() != Some(state.revision)
+                    || params["config_digest"] != state.digest
+                {
+                    return Err("traffic config does not match applied Realm revision".into());
+                }
+                let actual: Value =
+                    serde_json::from_slice(&fs::read(self.config()).await.map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                if actual != state.config {
+                    return Err("Realm config drift".into());
+                }
+                let config: crate::realm_traffic::Config =
+                    serde_json::from_value(params["accounting"].clone()).map_err(|e| e.to_string())?;
+                config.validate()?;
+                let endpoints = state.config["endpoints"].as_array().ok_or("missing endpoints")?;
+                if endpoints.len() != config.rules.len()
+                    || !config.rules.iter().all(|r| {
+                        let listen = if r.listen == "::" {
+                            format!("[::]:{}", r.port)
+                        } else {
+                            format!("0.0.0.0:{}", r.port)
+                        };
+                        endpoints.iter().any(|e| e["listen"] == listen)
+                    })
+                {
+                    return Err("accounting listeners differ from applied Realm config".into());
+                }
+                crate::realm_traffic::configure(config).await?;
+                Ok(self.status().await)
+            }
             "realm.restart" => {
                 if !self.owned().await || !self.state_read().await.run {
                     return Err("Realm is unmanaged or is disabled".into());

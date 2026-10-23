@@ -6,6 +6,7 @@ mod commands;
 mod metric_worker;
 mod proxy_traffic;
 mod realm;
+mod realm_traffic;
 mod singbox;
 
 use std::sync::Arc;
@@ -394,7 +395,7 @@ async fn session(
     let mut last_frame = Instant::now();
 
     let mut hello = serde_json::to_value(facts)?;
-    hello["capabilities"] = serde_json::json!(["realm.v1"]);
+    hello["capabilities"] = serde_json::json!(["realm.v1", "realm.traffic.v1"]);
     send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
@@ -413,10 +414,23 @@ async fn session(
     let mut baseline = true;
     let mut traffic = proxy_traffic::Worker::new(manager.api_port());
     let mut traffic_error_reported = false;
+    let mut realm_tick = tokio::time::interval(Duration::from_millis(250));
+    realm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_realm = String::new();
+    let mut realm_status_at = Instant::now();
 
     let result = loop {
         tokio::select! {
             _ = commands.start_next(), if commands.has_pending() => {}
+            _ = realm_tick.tick() => {
+                let snapshot = realm_traffic::snapshot();
+                let text = snapshot.to_string();
+                if snapshot["collector"].as_str().is_some_and(realm_traffic::valid_key) && (text != last_realm || realm_status_at.elapsed() >= Duration::from_secs(5)) {
+                    last_realm = text;
+                    realm_status_at = Instant::now();
+                    if let Err(e) = send(&mut ws, notify("realm.traffic", snapshot), remaining(last_frame)).await { break Err(e); }
+                }
+            }
             _ = ticker.tick(), if !collecting => {
                 collecting = true;
             }
@@ -466,6 +480,7 @@ async fn session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if value["type"] == "realm_traffic_ack" { realm_traffic::ack(value); continue; }
                             if value.get("type").and_then(serde_json::Value::as_str) == Some("command") {
                                 if let Err(response) = commands.submit(value) {
                                     if let Err(e) = send(&mut ws, Message::Text(response.to_string().into()), remaining(last_frame)).await {

@@ -162,7 +162,7 @@ impl Manager {
     async fn status(&self) -> Value {
         let installed = self.root.join("realm").is_file();
         let managed = self.owned().await;
-        let version = if installed {
+        let version = if installed && managed {
             run(self.root.join("realm").to_str().unwrap_or(""), &["--version"])
                 .await
                 .ok()
@@ -542,5 +542,20 @@ esac
             }
             fs::remove_dir_all(dir).await.unwrap();
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_does_not_execute_unmanaged_binary() {
+        let (manager, dir) = fixture(Init::Systemd).await;
+        fs::remove_file(dir.join(".realm-managed")).await.unwrap();
+        fs::write(dir.join("realm"), format!("#!/bin/sh\ntouch '{}'\n", dir.join("executed").display()))
+            .await
+            .unwrap();
+        let status = manager.execute("realm.status", &json!({})).await.unwrap();
+        assert_eq!(status["installed"], true);
+        assert_eq!(status["managed"], false);
+        assert!(status["version"].is_null());
+        assert!(!dir.join("executed").exists());
+        fs::remove_dir_all(dir).await.unwrap();
     }
 }

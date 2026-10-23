@@ -4,6 +4,16 @@
 
 静态链接单文件，无运行时依赖，常驻内存数 MB。
 
+## 发布签名
+
+发布仓库的 Actions Secret `AGENT_SIGNING_PRIVATE_KEY` 必须保存 Ed25519 私钥的完整 PEM 文本。
+对应的原始 32 字节公钥以十六进制保存在 `release-signing-public-key.hex`，必须与 Hub
+`src/main.rs` 中的 `AGENT_SIGNING_KEY` 一致。私钥不得提交到仓库。
+
+tag 发布为两个架构的二进制生成同名 `.sig` 文件（原始 64 字节 Ed25519 签名），本地验签通过后
+才上传 Release。缺少私钥或公钥不匹配会终止发布。轮换密钥时必须同步更新并部署 Hub 公钥，
+然后发布 Agent；旧 Hub 无法验证新密钥签名。SHA256 清单同时覆盖二进制和签名文件。
+
 ## 特性
 
 - 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo

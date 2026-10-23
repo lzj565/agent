@@ -5,6 +5,7 @@ mod collect;
 mod commands;
 mod metric_worker;
 mod proxy_traffic;
+mod realm;
 mod singbox;
 
 use std::sync::Arc;
@@ -392,7 +393,9 @@ async fn session(
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    let mut hello = serde_json::to_value(facts)?;
+    hello["capabilities"] = serde_json::json!(["realm.v1"]);
+    send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut commands = commands::CommandQueue::new(command_slots, manager.clone(), result_tx.clone());
@@ -501,10 +504,17 @@ async fn command_result(manager: &Manager, command: &serde_json::Value) -> serde
     let id = command.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let action = command.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
     let params = command.get("params").unwrap_or(&serde_json::Value::Null);
-    match manager.execute(action, params).await {
+    let outcome = if action.starts_with("realm.") {
+        realm::execute(action, params).await
+    } else {
+        manager.execute(action, params).await
+    };
+    match outcome {
         Ok(result) => serde_json::json!({"type":"command_result", "id":id, "ok":true, "result":result}),
         Err(message) => {
-            let code = if matches!(
+            let code = if action.starts_with("realm.") {
+                "REALM_ERROR"
+            } else if matches!(
                 action,
                 "singbox.status"
                     | "singbox.config.get"

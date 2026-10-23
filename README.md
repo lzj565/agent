@@ -87,3 +87,12 @@ cargo clippy --all-targets
 ## 许可
 
 MIT
+
+
+### Realm panel management
+
+Agent 1.2.2 advertises the `realm.v1` capability. An updated Hub can manage the installer-owned `monitor-realm` service through `realm.status`, `realm.config.get`, `realm.config.check`, `realm.config.apply`, and `realm.restart`. The binary and configuration remain `/opt/monitor/realm` and `/opt/monitor/config/realm.json`.
+
+Only systemd and OpenRC services created by the monitor installer are accepted. Configuration transactions are serialized, atomically replaced, and rolled back with the previous running/enabled state on failure. The first takeover keeps `realm-panel-original.json`; revision/config metadata lives in `realm-state.json`. Restart refuses disabled services. TCP target probes are bounded to eight endpoints per status call and are distinct from proxy authentication checks.
+
+Realm installation remains an explicit installer operation (`--realm`); the Agent never downloads software or executes Hub-provided shell commands. Existing Hub versions may ignore the added hello capability; a new Hub reports older Agents as requiring an upgrade.

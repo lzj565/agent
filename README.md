@@ -6,7 +6,7 @@
 
 ## 发布签名
 
-发布仓库的 Actions Secret `AGENT_SIGNING_PRIVATE_KEY` 必须保存 Ed25519 私钥的完整 PEM 文本。
+发布仓库的 Actions Secret `RELEASE_SIGNING_PRIVATE_KEY` 必须保存 Ed25519 私钥的完整 PEM 文本。
 对应的原始 32 字节公钥以十六进制保存在 `release-signing-public-key.hex`，必须与 Hub
 `src/main.rs` 中的 `AGENT_SIGNING_KEY` 一致。私钥不得提交到仓库。
 

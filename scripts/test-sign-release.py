@@ -22,7 +22,7 @@ def main():
                     for arch in ("x86_64", "aarch64")]
         for binary in binaries:
             binary.write_bytes(b"test release payload")
-        env = dict(os.environ, AGENT_SIGNING_PRIVATE_KEY=key.read_text())
+        env = dict(os.environ, RELEASE_SIGNING_PRIVATE_KEY=key.read_text())
         command = ["python3", str(root / "scripts/sign-release.py")]
         subprocess.run(command, env=env, check=True)
         pubfile = root / "public.der"
@@ -35,7 +35,7 @@ def main():
             assert result.returncode != 0, "tampered binary accepted"
         pin.write_text("00" * 32)
         assert subprocess.run(command, env=env, capture_output=True).returncode != 0
-        env.pop("AGENT_SIGNING_PRIVATE_KEY")
+        env.pop("RELEASE_SIGNING_PRIVATE_KEY")
         assert subprocess.run(command, env=env, capture_output=True).returncode != 0
         print("PASS: signatures, tampering, wrong key, missing secret")
 

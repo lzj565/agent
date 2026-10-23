@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign release binaries with the Ed25519 PEM in AGENT_SIGNING_PRIVATE_KEY."""
+"""Sign release binaries with the Ed25519 PEM in RELEASE_SIGNING_PRIVATE_KEY."""
 import os
 from pathlib import Path
 import subprocess
@@ -15,9 +15,9 @@ def main():
     expected = bytes.fromhex((root / "release-signing-public-key.hex").read_text().strip())
     if len(expected) != 32:
         raise SystemExit("Expected a raw 32-byte Ed25519 public key")
-    private = os.environ.get("AGENT_SIGNING_PRIVATE_KEY", "")
+    private = os.environ.get("RELEASE_SIGNING_PRIVATE_KEY", "")
     if not private:
-        raise SystemExit("AGENT_SIGNING_PRIVATE_KEY is required; refusing an unsigned release")
+        raise SystemExit("RELEASE_SIGNING_PRIVATE_KEY is required; refusing an unsigned release")
     with tempfile.TemporaryDirectory() as directory:
         key = Path(directory) / "key.pem"
         key.touch(mode=0o600)

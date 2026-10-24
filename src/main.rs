@@ -3,6 +3,7 @@
 mod api_config;
 mod collect;
 mod commands;
+mod components;
 mod metric_worker;
 mod mieru;
 mod proxy_traffic;
@@ -397,7 +398,7 @@ async fn session(
 
     let mut hello = serde_json::to_value(facts)?;
     hello["capabilities"] =
-        serde_json::json!(["realm.v1", "realm.traffic.v1", "mieru.v1", "mieru.traffic.v1"]);
+        serde_json::json!(["realm.v1", "realm.traffic.v1", "mieru.v1", "mieru.traffic.v1", "components.v1"]);
     send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
@@ -433,6 +434,7 @@ async fn session(
             }
         }
     });
+    let mut components = components::Worker::new();
     let mut realm_tick = tokio::time::interval(Duration::from_millis(250));
     realm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_realm = String::new();
@@ -441,6 +443,9 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = commands.start_next(), if commands.has_pending() => {}
+            Some(snapshot) = components.recv() => {
+                if let Err(e)=send(&mut ws,notify("components.status",snapshot),remaining(last_frame)).await {break Err(e)}
+            }
             Some(snapshot) = mieru_rx.recv() => {
                 if let Err(e)=send(&mut ws, notify("mieru.traffic",snapshot),remaining(last_frame)).await {break Err(e)}
             }

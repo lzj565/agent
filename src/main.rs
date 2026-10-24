@@ -4,6 +4,7 @@ mod api_config;
 mod collect;
 mod commands;
 mod metric_worker;
+mod mieru;
 mod proxy_traffic;
 mod realm;
 mod realm_traffic;
@@ -395,7 +396,8 @@ async fn session(
     let mut last_frame = Instant::now();
 
     let mut hello = serde_json::to_value(facts)?;
-    hello["capabilities"] = serde_json::json!(["realm.v1", "realm.traffic.v1"]);
+    hello["capabilities"] =
+        serde_json::json!(["realm.v1", "realm.traffic.v1", "mieru.v1", "mieru.traffic.v1"]);
     send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
@@ -414,6 +416,23 @@ async fn session(
     let mut baseline = true;
     let mut traffic = proxy_traffic::Worker::new(manager.api_port());
     let mut traffic_error_reported = false;
+    let (mieru_tx, mut mieru_rx) = mpsc::channel(1);
+    let mieru_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let seq = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64;
+            if let Some(v) = mieru::collect(seq).await {
+                if mieru_tx.send(v).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
     let mut realm_tick = tokio::time::interval(Duration::from_millis(250));
     realm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_realm = String::new();
@@ -422,6 +441,9 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = commands.start_next(), if commands.has_pending() => {}
+            Some(snapshot) = mieru_rx.recv() => {
+                if let Err(e)=send(&mut ws, notify("mieru.traffic",snapshot),remaining(last_frame)).await {break Err(e)}
+            }
             _ = realm_tick.tick() => {
                 let snapshot = realm_traffic::snapshot();
                 let text = snapshot.to_string();
@@ -509,6 +531,7 @@ async fn session(
         }
     };
 
+    mieru_task.abort();
     for (_, handle) in ping_tasks {
         handle.abort();
     }
@@ -519,7 +542,9 @@ async fn command_result(manager: &Manager, command: &serde_json::Value) -> serde
     let id = command.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let action = command.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
     let params = command.get("params").unwrap_or(&serde_json::Value::Null);
-    let outcome = if action.starts_with("realm.") {
+    let outcome = if action.starts_with("mieru.") {
+        mieru::execute(action, params).await
+    } else if action.starts_with("realm.") {
         realm::execute(action, params).await
     } else {
         manager.execute(action, params).await
@@ -527,7 +552,9 @@ async fn command_result(manager: &Manager, command: &serde_json::Value) -> serde
     match outcome {
         Ok(result) => serde_json::json!({"type":"command_result", "id":id, "ok":true, "result":result}),
         Err(message) => {
-            let code = if action.starts_with("realm.") {
+            let code = if action.starts_with("mieru.") {
+                "MIERU_ERROR"
+            } else if action.starts_with("realm.") {
                 "REALM_ERROR"
             } else if matches!(
                 action,

@@ -33,6 +33,11 @@ impl Worker {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
+                if std::path::Path::new("/opt/monitor/.skip-sing-box").is_file()
+                    && !std::path::Path::new("/opt/monitor/sing-box").is_file()
+                {
+                    continue;
+                }
                 let reading = tokio::time::timeout(QUERY_TIMEOUT, collector.collect())
                     .await
                     .unwrap_or_else(|_| Err(anyhow!("query timed out after 3s")));

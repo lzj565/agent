@@ -5,10 +5,7 @@ mod collect;
 mod commands;
 mod components;
 mod metric_worker;
-mod mieru;
 mod proxy_traffic;
-mod realm;
-mod realm_traffic;
 mod singbox;
 
 use std::sync::Arc;
@@ -443,7 +440,7 @@ async fn session(
 
     let mut hello = serde_json::to_value(&facts)?;
     hello["capabilities"] =
-        serde_json::json!(["realm.v1", "realm.traffic.v1", "mieru.v1", "mieru.traffic.v1", "components.v1"]);
+        serde_json::json!(["components.v1"]);
     for (key, value) in collector.capacities().await? {
         hello[key] = value.into();
     }
@@ -466,28 +463,7 @@ async fn session(
     let mut baseline = true;
     let mut traffic = proxy_traffic::Worker::new(manager.api_port());
     let mut traffic_error_reported = false;
-    let (mieru_tx, mut mieru_rx) = mpsc::channel(1);
-    let mieru_task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            tick.tick().await;
-            let seq = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(i64::MAX as u128) as i64;
-            if let Some(v) = mieru::collect(seq).await {
-                if mieru_tx.send(v).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
     let mut components = components::Worker::new();
-    let mut realm_tick = tokio::time::interval(Duration::from_millis(250));
-    realm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_realm = String::new();
-    let mut realm_status_at = Instant::now();
     let mut recheck = tokio::time::interval_at(Instant::now() + FACTS_RECHECK, FACTS_RECHECK);
     recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut refreshing = false;
@@ -498,18 +474,6 @@ async fn session(
             _ = commands.start_next(), if commands.has_pending() => {}
             Some(snapshot) = components.recv() => {
                 if let Err(e)=send(&mut ws,notify("components.status",snapshot),remaining(last_frame)).await {break Err(e)}
-            }
-            Some(snapshot) = mieru_rx.recv() => {
-                if let Err(e)=send(&mut ws, notify("mieru.traffic",snapshot),remaining(last_frame)).await {break Err(e)}
-            }
-            _ = realm_tick.tick() => {
-                let snapshot = realm_traffic::snapshot();
-                let text = snapshot.to_string();
-                if snapshot["collector"].as_str().is_some_and(realm_traffic::valid_key) && (text != last_realm || realm_status_at.elapsed() >= Duration::from_secs(5)) {
-                    last_realm = text;
-                    realm_status_at = Instant::now();
-                    if let Err(e) = send(&mut ws, notify("realm.traffic", snapshot), remaining(last_frame)).await { break Err(e); }
-                }
             }
             _ = ticker.tick(), if !collecting => {
                 collecting = true;
@@ -577,7 +541,6 @@ async fn session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if value["type"] == "realm_traffic_ack" { realm_traffic::ack(value); continue; }
                             if value.get("type").and_then(serde_json::Value::as_str) == Some("command") {
                                 if let Err(response) = commands.submit(value) {
                                     if let Err(e) = send(&mut ws, Message::Text(response.to_string().into()), remaining(last_frame)).await {
@@ -606,7 +569,6 @@ async fn session(
         }
     };
 
-    mieru_task.abort();
     for (_, handle) in ping_tasks {
         handle.abort();
     }
@@ -617,21 +579,11 @@ async fn command_result(manager: &Manager, command: &serde_json::Value) -> serde
     let id = command.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let action = command.get("action").and_then(serde_json::Value::as_str).unwrap_or("");
     let params = command.get("params").unwrap_or(&serde_json::Value::Null);
-    let outcome = if action.starts_with("mieru.") {
-        mieru::execute(action, params).await
-    } else if action.starts_with("realm.") {
-        realm::execute(action, params).await
-    } else {
-        manager.execute(action, params).await
-    };
+    let outcome = manager.execute(action, params).await;
     match outcome {
         Ok(result) => serde_json::json!({"type":"command_result", "id":id, "ok":true, "result":result}),
         Err(message) => {
-            let code = if action.starts_with("mieru.") {
-                "MIERU_ERROR"
-            } else if action.starts_with("realm.") {
-                "REALM_ERROR"
-            } else if matches!(
+            let code = if matches!(
                 action,
                 "singbox.status"
                     | "singbox.config.get"

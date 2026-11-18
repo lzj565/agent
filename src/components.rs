@@ -35,36 +35,6 @@ impl Drop for Worker {
         self.task.abort()
     }
 }
-struct Component {
-    key: &'static str,
-    binary: &'static str,
-    version_arg: &'static str,
-    service: &'static str,
-    marker: Option<&'static str>,
-}
-const CORES: [Component; 3] = [
-    Component {
-        key: "singbox",
-        binary: "sing-box",
-        version_arg: "version",
-        service: "sing-box",
-        marker: None,
-    },
-    Component {
-        key: "realm",
-        binary: "realm",
-        version_arg: "--version",
-        service: "monitor-realm",
-        marker: Some(".realm-managed"),
-    },
-    Component {
-        key: "mieru",
-        binary: "mita",
-        version_arg: "version",
-        service: "monitor-mieru",
-        marker: Some(".mieru-managed"),
-    },
-];
 async fn run(program: &Path, args: &[&str]) -> Result<(i32, String), String> {
     let output = tokio::time::timeout(
         Duration::from_secs(3),
@@ -78,27 +48,27 @@ async fn run(program: &Path, args: &[&str]) -> Result<(i32, String), String> {
     }
     Ok((output.status.code().unwrap_or(-1), String::from_utf8_lossy(&output.stdout).into_owned()))
 }
-async fn observe(root: &Path, c: &Component) -> Value {
+async fn observe(root: &Path) -> Value {
     use std::os::unix::fs::PermissionsExt;
-    let binary = root.join(c.binary);
+    let binary = root.join("sing-box");
     let metadata = fs::metadata(&binary).await;
     let installed = metadata.as_ref().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
     let systemd = Path::new("/run/systemd/system").exists();
     let openrc = Path::new("/run/openrc/softlevel").exists();
     let service_file = if systemd {
-        PathBuf::from(format!("/etc/systemd/system/{}.service", c.service))
+        PathBuf::from("/etc/systemd/system/sing-box.service")
     } else {
-        PathBuf::from(format!("/etc/init.d/{}", c.service))
+        PathBuf::from("/etc/init.d/sing-box")
     };
     let service_owned =
         fs::read_to_string(service_file).await.is_ok_and(|s| s.contains(binary.to_string_lossy().as_ref()));
-    let managed = installed && service_owned && c.marker.is_none_or(|m| root.join(m).is_file());
+    let managed = installed && service_owned;
     let mut out = json!({"installed":installed,"managed":managed,"version":""});
     if metadata.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) {
         return json!({"error":"cannot inspect component binary"});
     }
     if installed {
-        match run(&binary, &[c.version_arg]).await {
+        match run(&binary, &["version"]).await {
             Ok((0, text)) => {
                 out["version"] =
                     json!(text.lines().next().unwrap_or("").chars().take(128).collect::<String>())
@@ -109,9 +79,9 @@ async fn observe(root: &Path, c: &Component) -> Value {
         }
     }
     let service = if systemd {
-        run(Path::new("/usr/bin/systemctl"), &["is-active", "--quiet", c.service]).await
+        run(Path::new("/usr/bin/systemctl"), &["is-active", "--quiet", "sing-box"]).await
     } else if openrc {
-        run(Path::new("/sbin/rc-service"), &[c.service, "status"]).await
+        run(Path::new("/sbin/rc-service"), &["sing-box", "status"]).await
     } else {
         Err("unsupported init system".into())
     };
@@ -122,16 +92,10 @@ async fn observe(root: &Path, c: &Component) -> Value {
     out
 }
 async fn collect() -> Value {
-    // Probe sequentially: three Go/Rust binaries at once would increase the Agent cgroup's peak memory.
-    let mut readings = serde_json::Map::new();
-    for component in &CORES {
-        let value =
-            tokio::time::timeout(Duration::from_secs(8), observe(Path::new("/opt/monitor"), component))
-                .await
-                .unwrap_or_else(|_| json!({"error":"component inventory timed out"}));
-        readings.insert(component.key.to_owned(), value);
-    }
-    Value::Object(readings)
+    let reading = tokio::time::timeout(Duration::from_secs(8), observe(Path::new("/opt/monitor")))
+        .await
+        .unwrap_or_else(|_| json!({"error":"component inventory timed out"}));
+    json!({"singbox": reading})
 }
 #[cfg(test)]
 mod tests {
@@ -148,7 +112,6 @@ mod tests {
     async fn absent_binary_is_not_inferred_installed_from_capability() {
         let v = observe(
             &std::env::temp_dir().join(format!("absent-components-{}", rand::random::<u64>())),
-            &CORES[2],
         )
         .await;
         assert_eq!(v["installed"], false);

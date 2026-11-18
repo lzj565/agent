@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent"
-version = "1.2.5"
+version = "1.2.6"
 edition = "2021"
 license = "MIT"
 description = "Linux monitoring agent for the monitor hub"
@@ -16,8 +16,8 @@ rand = "0.9"
 # Linux metric collection and its baselines.
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "fs", "process"] }
 rustix = { version = "1", features = ["fs"] }
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-# tokio-tungstenite 0.28 leaves the crypto provider to the caller: rustls
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# tokio-tungstenite leaves the crypto provider to the caller: rustls
 # selects one automatically only when exactly one provider feature is enabled.
 # Without this the agent panics on its first wss:// connection.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -31,6 +31,15 @@ tonic-prost = "0.14.6"
 # Only the tests need a movable clock; the write-deadline arithmetic spans
 # minutes. dev-dependencies do not reach the shipped binary.
 tokio = { version = "1", features = ["test-util"] }
+
+# On top of clippy's defaults, which CI runs with -D warnings. Tests may still
+# unwrap (clippy.toml).
+[lints.clippy]
+# The release build aborts on panic, so a failed unwrap takes the whole agent
+# down until systemd restarts it: use ?, or expect("why this cannot fail").
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
 
 [profile.release]
 codegen-units = 1

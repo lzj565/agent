@@ -27,9 +27,9 @@ use serde::Serialize;
 /// from a container's only link -- an LXC guest's veth, the tap of a rootless
 /// container's pasta network -- and a guest counted as virtual would report no
 /// traffic at all. Bridge ports and other tunnels are recognised by
-/// [`counted_elsewhere`] whatever their name; the tunnel entries here also keep
-/// their addresses out of [`addresses`]. `--iface` covers whatever neither
-/// catches.
+/// [`counted_elsewhere`] whatever their name; the entries here also keep their
+/// addresses out of [`addresses`], see [`lends_address`]. `--iface` covers
+/// whatever neither catches.
 const SKIP_IFACES: &[&str] = &[
     "lo",
     "docker",
@@ -98,7 +98,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "9p",
 ];
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 pub struct Facts {
     pub hostname: String,
     pub os: String,
@@ -107,9 +107,6 @@ pub struct Facts {
     pub virt: String,
     pub cpu_name: String,
     pub cpu_cores: u32,
-    pub mem_total: u64,
-    pub swap_total: u64,
-    pub disk_total: u64,
     pub agent_version: String,
     /// The host's own addresses, public ones first; see [`pick`]. The hub sees
     /// only the family the agent connected over.
@@ -180,7 +177,7 @@ impl Ifaces {
             };
             // Rejected rather than left to match nothing or everything: each
             // would silently change the totals. install.sh and the panel refuse
-            // the same entries.
+            // these too, and admit only letters, digits, `.`, `_` and `-`.
             if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
                 return Err(format!(
                     "--iface: {entry:?} is not an interface name; give full names separated by commas"
@@ -250,11 +247,24 @@ impl Collector {
         net_dev(dev).filter(|(name, ..)| self.ifaces.counts(Path::new(SYS_NET), name)).collect()
     }
 
+    /// Memory, swap and disk totals as a report carries them, for the first
+    /// hello of a session alone. A hub that stores the capacities from the
+    /// hello -- one from 1.3 or earlier never takes them from a report --
+    /// would otherwise record zeros. They stay out of [`Facts`], which a
+    /// session resends whenever it differs, and a total that floats with
+    /// writes, as on ZFS, would resend it every minute.
+    pub fn capacities(&self) -> [(&'static str, u64); 3] {
+        let mem = meminfo();
+        [
+            ("mem_total", mem_used(&mem).0),
+            ("swap_total", swap_used(&mem).0),
+            ("disk_total", disk_usage(&real_mount_points()).0),
+        ]
+    }
+
     pub fn facts(&self) -> Facts {
         let (v4, v6) = addresses();
-        let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&real_mount_points());
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -263,9 +273,6 @@ impl Collector {
             virt: virtualization(),
             cpu_name,
             cpu_cores,
-            mem_total: mem.get("MemTotal").copied().unwrap_or(0),
-            swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
-            disk_total,
             agent_version: env!("CARGO_PKG_VERSION").into(),
             ipv4: v4,
             ipv6: v6,
@@ -402,7 +409,8 @@ fn parse_meminfo(text: &str) -> HashMap<String, u64> {
         .collect()
 }
 
-/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate.
+/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate, or
+/// minus MemFree where the estimate exceeds the total.
 /// sysinfo's `used_memory()` counts page cache as used and reads gigabytes high
 /// on a host that has been up for a while.
 fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
@@ -416,6 +424,10 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
     // would understate used memory precisely when it matters.
     let available =
         m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
+    // Above the total, as LXCFS can report it, procps-ng 4 discards the estimate
+    // and `free` shows total - MemFree; subtracting it would report 0. The
+    // fallback sum is held to the same bound.
+    let available = if available > total { g("MemFree") } else { available };
     (total, total.saturating_sub(available))
 }
 
@@ -478,7 +490,7 @@ fn uptime() -> u64 {
 /// which is what the machine actually holds -- no external service is
 /// consulted.
 ///
-/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
+/// Filtered by [`lends_address`], so a docker bridge cannot pass for the
 /// machine's address. [`is_stacked`] is not applied here: it answers whether
 /// bytes were already counted lower down, and a bridge holding the host address
 /// is both stacked and this machine.
@@ -487,10 +499,39 @@ fn addresses() -> (String, String) {
     let held: Vec<IpAddr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| !skip_iface(&i.name) && !i.is_link_local() && i.is_oper_up())
+        .filter(|i| reportable(&i.name, i.ip(), i.is_oper_up()))
         .map(|i| i.ip())
         .collect();
     pick(&held, &transient)
+}
+
+/// Whether an address held by interface `name` may be reported as this
+/// machine's: one the interface lends, not link-local, on an interface that is
+/// up. Link-local addresses sit on every interface that has IPv6; where nothing
+/// public outranks them in [`pick`] they would be reported.
+fn reportable(name: &str, ip: IpAddr, up: bool) -> bool {
+    let link_local = match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    };
+    up && !link_local && lends_address(name, ip)
+}
+
+/// Whether an address on this interface may be the machine's own. A skipped
+/// interface lends none: its addresses belong to the containers, guests or
+/// overlay behind it. WireGuard is the exception for a public v6, since a
+/// machine without IPv6 of its own gets a routed prefix through one. VPN
+/// clients' own addresses are private, CGNAT or ULA, which [`is_public`]
+/// rejects. Cloudflare WARP is the one that is not: it puts a global
+/// 2606:4700::/32 address on the tunnel, shared by every user of the service
+/// and not reachable from outside. That range is left out on every interface,
+/// whatever the script setting up the tunnel named it -- `wgcf`, `warp`,
+/// `CloudflareWARP` -- since only Cloudflare's own machines hold it natively.
+fn lends_address(name: &str, ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) if v6.segments()[..2] == [0x2606, 0x4700] => false,
+        _ => !skip_iface(name) || (name.starts_with("wg") && ip.is_ipv6() && is_public(ip)),
+    }
 }
 
 /// A public address before any other, then a stable v6 before a transient
@@ -591,7 +632,7 @@ fn is_stacked(name: &str) -> bool {
 
 const SYS_NET: &str = "/sys/class/net";
 
-/// Link types of layer-3 tunnels as /sys/class/net/<name>/type prints them:
+/// Link types of layer-3 tunnels as `/sys/class/net/<name>/type` prints them:
 /// none (tun, WireGuard, Tailscale), ipip, ip6tnl, sit, gre, ip6gre. Read off
 /// devices of each kind created on a 6.1 kernel. OpenVZ's `venet0`, a
 /// container's only link, is void (65535) and stays out.
@@ -678,8 +719,13 @@ fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
 }
 
 fn parse_mounts(text: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
+    real_mounts(text).into_iter().map(|(_, mount)| mount).collect()
+}
+
+/// [`parse_mounts`] with the key each point was deduplicated by: the source
+/// device, or a ZFS pool.
+fn real_mounts(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     let rows = mount_rows(text);
     // The table is in mount order and a path resolves to the last mount on it,
     // which is what statvfs below answers for. An earlier entry for the same
@@ -698,13 +744,28 @@ fn parse_mounts(text: &str) -> Vec<String> {
         if !dev.starts_with('/') && fstype != "zfs" && fstype != "btrfs" {
             continue;
         }
-        // ZFS datasets and btrfs subvolumes share one pool's free space.
-        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev).to_owned();
-        if seen.contains(&key) {
+        // ZFS mounts a snapshot under .zfs/snapshot whenever something reads
+        // it, as `tank/set@daily` or, for the pool's top dataset, `tank@daily`;
+        // the latter would pass for a pool of its own and add the pool's free
+        // space a second time.
+        if fstype == "zfs" && dev.contains('@') {
             continue;
         }
-        seen.push(key);
-        out.push(mount.replace("\\040", " "));
+        // ZFS datasets and btrfs subvolumes share one pool's free space.
+        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev);
+        if out.iter().any(|(k, _)| k == key) {
+            continue;
+        }
+        out.push((key.to_owned(), mount.replace("\\040", " ")));
+    }
+    // An overlay root is skipped because its backing disk normally shows up
+    // through another row, as Docker's /etc/hosts bind does. Podman binds those
+    // files from a tmpfs, leaving no row at all, and statvfs on `/` is what df
+    // reports there. Only when nothing else counted: adding `/` beside a row
+    // for the same disk would count it twice.
+    if out.is_empty() && top.get("/").is_some_and(|&i| matches!(rows[i].2, "overlay" | "fuse.fuse-overlayfs"))
+    {
+        out.push(("/".to_owned(), "/".to_owned()));
     }
     out
 }
@@ -715,8 +776,8 @@ fn parse_mounts(text: &str) -> Vec<String> {
 ///
 /// The `install.sh` unit sets `ProtectHome=yes`, which mounts a tmpfs over
 /// /home. Where /home is its own filesystem, `df` on the host and the panel then
-/// disagree by its entire size. Reported once at startup, since the discrepancy
-/// is otherwise visible only in the totals themselves.
+/// disagree by its entire size. Reported at startup in place of
+/// [`hidden_mounts`] where PID 1's table cannot be read.
 pub fn shadowed_mounts(text: &str) -> Vec<String> {
     let rows = mount_rows(text);
     rows.iter()
@@ -730,6 +791,28 @@ pub fn shadowed_mounts(text: &str) -> Vec<String> {
                     .is_some_and(|(_, _, top)| skip_fstype(top))
         })
         .map(|(_, (_, mount, _))| mount.replace("\\040", " "))
+        .collect()
+}
+
+/// Real filesystems the host mounts that this mount namespace cannot reach,
+/// given the tables of PID 1 and of this process. `ProtectHome=yes` drops every
+/// mount beneath /root and /home from the agent's namespace and covers a
+/// separate /home, so `df` as root counts disks the agent never sees. Compared
+/// by device, so a disk hidden at one point and reachable at another counts as
+/// reachable.
+pub fn hidden_mounts(host: &str, own: &str) -> Vec<String> {
+    let reachable: Vec<String> = real_mounts(own).into_iter().map(|(dev, _)| dev).collect();
+    real_mounts(host).into_iter().filter(|(dev, _)| !reachable.contains(dev)).map(|(_, m)| m).collect()
+}
+
+/// Mount points in this namespace that `statvfs` refuses, with the reason,
+/// which [`disk_usage`] skips while `df` as root counts them: under the
+/// `install.sh` unit the agent runs as its own user, so a disk mounted below a
+/// directory closed to other users is one of these.
+pub fn unreadable_mounts(text: &str) -> Vec<(String, rustix::io::Errno)> {
+    parse_mounts(text)
+        .into_iter()
+        .filter_map(|m| rustix::fs::statvfs(m.as_str()).err().map(|e| (m, e)))
         .collect()
 }
 
@@ -1111,6 +1194,26 @@ fn platform_hypervisor() -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// A path under the temp directory, cleared of whatever a killed run under
+    /// the same PID left there, and removed with everything in it when dropped,
+    /// so a failing test leaves nothing behind either. A mutation run fails
+    /// thousands of them.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("monitor-agent-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn memory_matches_free_not_sysinfo() {
         // Real /proc/meminfo from a 3.8 GiB host holding 2.5 GiB of cache.
@@ -1142,6 +1245,13 @@ mod tests {
         let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 200 kB\nBuffers: 100 kB\nCached: 300 kB\n");
         assert_eq!(mem_used(&m), (1000 * 1024, 400 * 1024));
         assert_eq!(mem_used(&HashMap::new()), (0, 0));
+    }
+
+    #[test]
+    fn memory_ignores_a_memavailable_above_the_total() {
+        // `free` from procps-ng 4.0.4 on this /proc/meminfo shows used 700000.
+        let m = parse_meminfo("MemTotal: 1000000 kB\nMemFree: 300000 kB\nMemAvailable: 1200000 kB\n");
+        assert_eq!(mem_used(&m), (1000000 * 1024, 700000 * 1024));
     }
 
     #[test]
@@ -1242,8 +1352,9 @@ mod tests {
             assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
             assert!(!skip_iface(name), "{name} is where a host address lives");
         }
-        // Neither this machine's traffic nor its address: container networks,
-        // and tunnels whose payload leaves inside a packet eth0 has counted.
+        // Not this machine's traffic: container networks, and tunnels whose
+        // payload leaves inside a packet eth0 has counted. Their addresses are
+        // lent only as [`lends_address`] allows.
         for name in [
             "lo",
             "docker0",
@@ -1277,9 +1388,8 @@ mod tests {
     /// master but is no bridge's port.
     #[test]
     fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
-        let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
-        // Left behind by a failed run under a reused PID.
-        let _ = fs::remove_dir_all(&sys);
+        let tmp = TempDir::new("sys");
+        let sys = tmp.0.clone();
         for (name, ty, extra) in [
             ("he-ipv6", 776, &[][..]),
             ("nebula1", 65534, &[]),
@@ -1316,7 +1426,6 @@ mod tests {
         for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "up1", "absent0"] {
             assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
         }
-        fs::remove_dir_all(&sys).unwrap();
     }
 
     /// Each kind of container as an unprivileged process sees it. The host of
@@ -1324,7 +1433,8 @@ mod tests {
     /// LXCFS mounted outside /proc -- and is no container.
     #[test]
     fn a_container_is_named_from_what_an_unprivileged_process_can_read() {
-        let root = std::env::temp_dir().join(format!("monitor-agent-root-{}", std::process::id()));
+        let tmp = TempDir::new("root");
+        let root = tmp.0.clone();
         let lxcfs = "lxcfs /proc/meminfo fuse.lxcfs rw,nosuid,nodev 0 0\n";
         let lxcfs_host = "lxcfs /var/lib/lxcfs fuse.lxcfs rw,nosuid,nodev 0 0\n";
         for (files, mounts, expected) in [
@@ -1337,7 +1447,7 @@ mod tests {
             (&[], lxcfs_host, None),
             (&[], "", None),
         ] {
-            // Left behind by a failed run under a reused PID, or by the last case.
+            // Left behind by the last case.
             let _ = fs::remove_dir_all(&root);
             for file in files {
                 let (path, content) = file.split_once('=').unwrap_or((file, ""));
@@ -1346,7 +1456,6 @@ mod tests {
             }
             assert_eq!(container(&root, mounts).as_deref(), expected, "{files:?} {mounts:?}");
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A router forwards each byte across two real NICs, so only its owner can
@@ -1375,6 +1484,16 @@ mod tests {
         for bad in ["eth0 eth1", "-", "eth0,-", "--eth0"] {
             assert!(Ifaces::parse(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    /// The panel's reinstall dialog starts from the filter a node reports, so
+    /// the report carries the one in force: trimmed, empty entries dropped, in
+    /// the order given. The panel splits it into its two lists, so the order
+    /// carries no meaning.
+    #[test]
+    fn the_report_names_the_filter_in_force() {
+        let ifaces = Ifaces::parse(" wan , -eth0 , lan ,").unwrap();
+        assert_eq!(Collector::new(ifaces).collect().iface, "wan,-eth0,lan");
     }
 
     /// Any change to which interfaces are summed, within one boot, must make the
@@ -1458,6 +1577,47 @@ mod tests {
     }
 
     #[test]
+    fn only_an_up_interfaces_own_routable_address_is_reported() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(reportable("eth0", ip("10.0.0.2"), true));
+        assert!(reportable("eth0", ip("2001:db8::2"), true));
+        // On a host with only a private v4 and no global v6, as behind NAT,
+        // nothing public outranks these in `pick`.
+        assert!(!reportable("lo", ip("127.0.0.1"), true), "loopback");
+        assert!(!reportable("lo", ip("::1"), true));
+        assert!(
+            !reportable("eth0", ip("fe80::5054:ff:fe12:3456"), true),
+            "link-local v6 sits on every interface"
+        );
+        assert!(!reportable("eth0", ip("169.254.10.1"), true), "link-local v4");
+        assert!(!reportable("eth1", ip("203.0.113.9"), false), "an interface that is down");
+    }
+
+    #[test]
+    fn a_wireguard_link_lends_only_a_public_v6() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(lends_address("wg0", ip("2001:db8::2")), "a routed prefix through the tunnel");
+        assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
+        assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
+        assert!(!lends_address("wg0", ip("fd00::2")));
+        assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
+        assert!(!lends_address("tailscale0", ip("2001:db8::2")));
+        for name in ["wgcf", "warp", "CloudflareWARP"] {
+            assert!(!lends_address(name, ip("2606:4700:110:8a36::1")), "WARP's shared address under {name}");
+        }
+        assert!(lends_address("warp", ip("2001:db8::3")), "only the range is left out, not the name");
+
+        // What `addresses` makes of a machine with a private v4 and a v6 only
+        // through WireGuard.
+        let held: Vec<IpAddr> = [("eth0", "10.0.0.2"), ("wg0", "10.9.0.2"), ("wg0", "2001:db8::2")]
+            .into_iter()
+            .filter(|(n, a)| lends_address(n, ip(a)))
+            .map(|(_, a)| ip(a))
+            .collect();
+        assert_eq!(pick(&held, &[]), ("10.0.0.2".to_owned(), "2001:db8::2".to_owned()));
+    }
+
+    #[test]
     fn only_globally_routable_addresses_count_as_public() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         for s in [
@@ -1520,7 +1680,9 @@ mod tests {
              /mnt/disk1:/mnt/disk2 /pool fuse.mergerfs rw 0 0\n\
              //nas/backup /mnt/nas cifs rw 0 0\n\
              tank/set1 /tank zfs rw 0 0\n\
-             tank/set2 /tank/sub zfs rw 0 0\n",
+             tank/set2 /tank/sub zfs rw 0 0\n\
+             tank@daily /tank/.zfs/snapshot/daily zfs ro 0 0\n\
+             tank/set2@daily /tank/sub/.zfs/snapshot/daily zfs ro 0 0\n",
         );
         // /snap/... is a real device holding a pseudo filesystem, rejected only
         // by the fstype list; one squashfs per snap would otherwise add a full
@@ -1533,7 +1695,9 @@ mod tests {
         // fuse driver mounts as `fuseblk` and still counts. The ecryptfs row is
         // a fourth: a stacked mount whose source is a directory on the filesystem
         // beneath it, so it passes the device check and carries a source of its
-        // own past the dedup, while statvfs reports that filesystem again.
+        // own past the dedup, while statvfs reports that filesystem again. The
+        // last two are ZFS snapshots mounted on access: one named after the
+        // pool's top dataset would otherwise count as a second pool.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
     }
 
@@ -1552,13 +1716,39 @@ mod tests {
         assert_eq!(shadowed_mounts(table), vec!["/home"]);
         // A point mounted once is not shadowed, however many others exist.
         assert!(shadowed_mounts("/dev/vda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n").is_empty());
+        // What ProtectHome leaves of the host's table: /home covered, mounts
+        // beneath /root and /home gone, /dev/vdd1 still reachable at /srv.
+        let host = "/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\n/dev/vdc1 /home/data ext4 rw 0 0\n\
+                    /dev/vdd1 /root/backup ext4 rw 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
+        let own = "/dev/vda1 / ext4 rw 0 0\n/dev/vdb1 /home ext4 rw 0 0\ntmpfs /home tmpfs ro 0 0\n\
+                   tmpfs /root tmpfs ro 0 0\n/dev/vdd1 /srv ext4 rw 0 0\n";
+        assert_eq!(hidden_mounts(host, own), ["/home", "/home/data"]);
+        assert!(hidden_mounts(host, host).is_empty(), "the same namespace hides nothing");
+    }
+
+    #[test]
+    fn an_overlay_root_counts_only_when_nothing_else_does() {
+        for root in ["overlay / overlay rw 0 0", "fuse-overlayfs / fuse.fuse-overlayfs rw 0 0"] {
+            let podman = format!("{root}\ntmpfs /etc/hosts tmpfs rw 0 0\n");
+            assert_eq!(parse_mounts(&podman), ["/"], "{root}");
+        }
+        // Docker binds /etc/hosts from the disk behind the overlay.
+        assert_eq!(
+            parse_mounts("overlay / overlay rw 0 0\n/dev/sda1 /etc/hosts ext4 rw 0 0\n"),
+            ["/etc/hosts"]
+        );
+        // An overlay elsewhere is a container's root seen from its host.
+        assert!(parse_mounts("tmpfs / tmpfs rw 0 0\noverlay /var/lib/x/merged overlay rw 0 0\n").is_empty());
     }
 
     #[test]
     fn real_host_collection_is_sane() {
         let mut c = Collector::default();
         let f = c.facts();
-        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
+        assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && c.capacities()[0].1 > 0);
+        // A session sends the facts again whenever they differ, so a field that
+        // moves on its own would resend them every minute.
+        assert!(c.facts() == f, "facts collected twice on an idle host differ");
         // Whatever this host reports must parse, and a virtual bridge must not
         // be selected.
         assert!(f.ipv4.is_empty() || f.ipv4.parse::<std::net::Ipv4Addr>().is_ok());
@@ -1574,6 +1764,22 @@ mod tests {
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
+        assert!(m.uptime > 0 && m.procs > 1, "uptime {} s, {} processes", m.uptime, m.procs);
+        // Every core kept busy between two samples: idle time read as busy
+        // would show under half.
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        std::thread::scope(|s| {
+            for _ in 0..cores {
+                s.spawn(|| {
+                    let spin = std::time::Instant::now();
+                    while spin.elapsed() < std::time::Duration::from_millis(300) {
+                        std::hint::black_box(0u64);
+                    }
+                });
+            }
+        });
+        let busy = c.collect().cpu;
+        assert!(busy > 50.0, "{busy}% with every core busy");
     }
 }
 

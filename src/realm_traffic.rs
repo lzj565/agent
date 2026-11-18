@@ -69,7 +69,7 @@ fn handle() -> &'static Handle {
         let (tx,rx)=mpsc::sync_channel(32); let snapshot=std::sync::Arc::new(Mutex::new(json!({"status":{"state":"waiting","reason":"等待有效规则"},"records":[]})));
         let shared=snapshot.clone();
         std::thread::Builder::new().name("realm-traffic".into()).spawn(move || {
-            let mut worker=match Ledger::open(Path::new("/opt/monitor/config")) { Ok(w)=>w, Err(e)=> { *shared.lock().unwrap()=json!({"collector":token(),"status":{"state":"unmonitored","reason":format!("ledger: {e}")},"records":[]}); return; } };
+            let mut worker=match Ledger::open(Path::new("/opt/monitor/config")) { Ok(w)=>w, Err(e)=> { *shared.lock().unwrap_or_else(|error| error.into_inner())=json!({"collector":token(),"status":{"state":"unmonitored","reason":format!("ledger: {e}")},"records":[]}); return; } };
             let mut next=Instant::now();
             loop {
                 match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
@@ -79,14 +79,14 @@ fn handle() -> &'static Handle {
                     Err(mpsc::RecvTimeoutError::Timeout)=>{}
                 }
                 if Instant::now()>=next { if let Err(e)=worker.sample() { let _=worker.disable(&e); } next=Instant::now()+Duration::from_secs(5); }
-                if let Ok(v)=worker.snapshot() { *shared.lock().unwrap()=v; }
+                if let Ok(v)=worker.snapshot() { *shared.lock().unwrap_or_else(|error| error.into_inner())=v; }
             }
         }).expect("realm traffic worker");
         Handle{tx,snapshot}
     })
 }
 pub fn snapshot() -> Value {
-    handle().snapshot.lock().unwrap().clone()
+    handle().snapshot.lock().unwrap_or_else(|error| error.into_inner()).clone()
 }
 pub fn ack(v: Value) {
     let _ = handle().tx.try_send(Request::Ack(v));
@@ -264,7 +264,9 @@ impl Ledger {
         if self.state == "unmonitored" && !manual {
             return Ok(self.status());
         }
-        if self.config.as_ref().unwrap().rules.is_empty() && self.state != "monitoring" {
+        if self.config.as_ref().expect("configuration was assigned above").rules.is_empty()
+            && self.state != "monitoring"
+        {
             return Ok(self.status());
         }
         if changed || manual || self.state != "monitoring" {
@@ -281,7 +283,14 @@ impl Ledger {
                 // Maps no longer reference retired counters. Drain them before deleting objects.
                 let mut retire = String::new();
                 for key in self.baseline.keys() {
-                    if !self.config.as_ref().unwrap().rules.iter().any(|r| &r.key == key) {
+                    if !self
+                        .config
+                        .as_ref()
+                        .expect("configuration was assigned above")
+                        .rules
+                        .iter()
+                        .any(|r| &r.key == key)
+                    {
                         retire += &format!(
                             "delete counter inet {TABLE} u_{key}\ndelete counter inet {TABLE} d_{key}\n"
                         );
@@ -290,11 +299,21 @@ impl Ledger {
                 if !retire.is_empty() {
                     nft(&self.root, &["-f"], Some(&retire))?;
                 }
-                self.baseline
-                    .retain(|key, _| self.config.as_ref().unwrap().rules.iter().any(|r| &r.key == key));
+                self.baseline.retain(|key, _| {
+                    self.config
+                        .as_ref()
+                        .expect("configuration was assigned above")
+                        .rules
+                        .iter()
+                        .any(|r| &r.key == key)
+                });
                 self.state =
-                    if self.config.as_ref().unwrap().rules.is_empty() { "waiting" } else { "monitoring" }
-                        .into();
+                    if self.config.as_ref().expect("configuration was assigned above").rules.is_empty() {
+                        "waiting"
+                    } else {
+                        "monitoring"
+                    }
+                    .into();
                 self.reason.clear();
                 self.persist()
             })();

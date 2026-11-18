@@ -444,6 +444,9 @@ async fn session(
     let mut hello = serde_json::to_value(&facts)?;
     hello["capabilities"] =
         serde_json::json!(["realm.v1", "realm.traffic.v1", "mieru.v1", "mieru.traffic.v1", "components.v1"]);
+    for (key, value) in collector.capacities().await? {
+        hello[key] = value.into();
+    }
     let hello_capabilities = hello["capabilities"].clone();
     send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 

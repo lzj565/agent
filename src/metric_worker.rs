@@ -6,12 +6,20 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::collect::{Collector, Facts, Metrics};
 
+type Capacities = [(&'static str, u64); 3];
+
 pub trait Source: Send + 'static {
     fn facts(&self) -> Facts;
     fn collect(&mut self) -> Metrics;
+    fn capacities(&self) -> Capacities {
+        [("mem_total", 0), ("swap_total", 0), ("disk_total", 0)]
+    }
 }
 
 impl Source for Collector {
+    fn capacities(&self) -> Capacities {
+        Collector::capacities(self)
+    }
     fn facts(&self) -> Facts {
         Collector::facts(self)
     }
@@ -22,6 +30,7 @@ impl Source for Collector {
 }
 
 enum Request {
+    Capacities(oneshot::Sender<Capacities>),
     Facts(oneshot::Sender<Facts>),
     Metrics(oneshot::Sender<Metrics>),
 }
@@ -41,6 +50,9 @@ impl Worker {
             .spawn(move || {
                 while let Some(request) = rx.blocking_recv() {
                     match request {
+                        Request::Capacities(reply) if !reply.is_closed() => {
+                            let _ = reply.send(source.capacities());
+                        }
                         Request::Facts(reply) if !reply.is_closed() => {
                             let _ = reply.send(source.facts());
                         }
@@ -53,6 +65,12 @@ impl Worker {
             })
             .context("start metrics worker")?;
         Ok(Self { requests })
+    }
+
+    pub async fn capacities(&self) -> Result<Capacities> {
+        let (reply, response) = oneshot::channel();
+        self.requests.send(Request::Capacities(reply)).await.context("metrics worker stopped")?;
+        response.await.context("metrics worker stopped while collecting capacity")
     }
 
     pub async fn facts(&self) -> Result<Facts> {
@@ -78,6 +96,9 @@ mod tests {
     }
 
     impl Source for Counter {
+        fn capacities(&self) -> Capacities {
+            Collector::default().capacities()
+        }
         fn facts(&self) -> Facts {
             Collector::default().facts()
         }

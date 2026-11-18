@@ -110,10 +110,8 @@ mod tests {
     }
     #[tokio::test]
     async fn absent_binary_is_not_inferred_installed_from_capability() {
-        let v = observe(
-            &std::env::temp_dir().join(format!("absent-components-{}", rand::random::<u64>())),
-        )
-        .await;
+        let v =
+            observe(&std::env::temp_dir().join(format!("absent-components-{}", rand::random::<u64>()))).await;
         assert_eq!(v["installed"], false);
         assert_eq!(v["managed"], false);
     }

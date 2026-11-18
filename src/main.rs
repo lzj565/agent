@@ -439,8 +439,7 @@ async fn session(
     let mut last_frame = Instant::now();
 
     let mut hello = serde_json::to_value(&facts)?;
-    hello["capabilities"] =
-        serde_json::json!(["components.v1"]);
+    hello["capabilities"] = serde_json::json!(["components.v1"]);
     for (key, value) in collector.capacities().await? {
         hello[key] = value.into();
     }

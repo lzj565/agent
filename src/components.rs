@@ -56,9 +56,9 @@ async fn observe(root: &Path) -> Value {
     let systemd = Path::new("/run/systemd/system").exists();
     let openrc = Path::new("/run/openrc/softlevel").exists();
     let service_file = if systemd {
-        PathBuf::from("/etc/systemd/system/sing-box.service")
+        PathBuf::from("/etc/systemd/system/sb.service")
     } else {
-        PathBuf::from("/etc/init.d/sing-box")
+        PathBuf::from("/etc/init.d/sb")
     };
     let service_owned =
         fs::read_to_string(service_file).await.is_ok_and(|s| s.contains(binary.to_string_lossy().as_ref()));
@@ -79,9 +79,9 @@ async fn observe(root: &Path) -> Value {
         }
     }
     let service = if systemd {
-        run(Path::new("/usr/bin/systemctl"), &["is-active", "--quiet", "sing-box"]).await
+        run(Path::new("/usr/bin/systemctl"), &["is-active", "--quiet", "sb.service"]).await
     } else if openrc {
-        run(Path::new("/sbin/rc-service"), &["sing-box", "status"]).await
+        run(Path::new("/sbin/rc-service"), &["sb", "status"]).await
     } else {
         Err("unsupported init system".into())
     };

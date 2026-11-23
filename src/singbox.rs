@@ -54,8 +54,8 @@ impl ServiceManager {
 
     async fn restart(&self) -> Result<(), String> {
         let args = match self.init {
-            InitSystem::Systemd => ["restart", "sing-box.service"],
-            InitSystem::OpenRc => ["sing-box", "restart"],
+            InitSystem::Systemd => ["restart", "sb.service"],
+            InitSystem::OpenRc => ["sb", "restart"],
             InitSystem::Unsupported => {
                 return Err(
                     "UNSUPPORTED_INIT_SYSTEM: unsupported init system: only systemd and OpenRC are supported"
@@ -80,8 +80,8 @@ impl ServiceManager {
 
     async fn is_running(&self) -> Result<bool, String> {
         let args = match self.init {
-            InitSystem::Systemd => ["is-active", "--quiet", "sing-box.service"],
-            InitSystem::OpenRc => ["sing-box", "status", ""],
+            InitSystem::Systemd => ["is-active", "--quiet", "sb.service"],
+            InitSystem::OpenRc => ["sb", "status", ""],
             InitSystem::Unsupported => {
                 return Err(
                     "UNSUPPORTED_INIT_SYSTEM: unsupported init system: only systemd and OpenRC are supported"
@@ -593,14 +593,14 @@ mod tests {
         f.manager.service.restart().await.unwrap();
         assert_eq!(f.manager.status().await.unwrap()["running"], true);
         let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
-        assert_eq!(calls, "sing-box restart\nsing-box status\nsing-box status\n");
+        assert_eq!(calls, "sb restart\nsb status\nsb status\n");
 
         std::fs::write(f.dir.join("fail-once"), "").unwrap();
         let err = f.manager.apply_config(&Fixture::candidate("new")).await.unwrap_err();
         assert!(err.contains("rollback: succeeded"));
         assert_eq!(f.config(), "old");
         let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
-        assert!(calls.ends_with("sing-box restart\nsing-box restart\nsing-box status\n"));
+        assert!(calls.ends_with("sb restart\nsb restart\nsb status\n"));
     }
 
     #[tokio::test]
@@ -609,7 +609,7 @@ mod tests {
         f.manager.service.restart().await.unwrap();
         assert_eq!(f.manager.status().await.unwrap()["running"], true);
         let calls = std::fs::read_to_string(f.dir.join("service.log")).unwrap();
-        assert_eq!(calls, "restart sing-box.service\nis-active --quiet sing-box.service\nis-active --quiet sing-box.service\n");
+        assert_eq!(calls, "restart sb.service\nis-active --quiet sb.service\nis-active --quiet sb.service\n");
     }
 
     #[tokio::test]

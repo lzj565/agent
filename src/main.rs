@@ -35,6 +35,7 @@ fn internal_command(args: &[String]) -> Option<i32> {
         return None;
     }
     let result = match args.get(1).map(String::as_str) {
+        Some("supports-sb-service") if args.len() == 2 => Ok(()),
         Some("api-port-from-config") if args.len() == 3 => {
             match std::fs::read_to_string(&args[2])
                 .map_err(|e| e.to_string())
